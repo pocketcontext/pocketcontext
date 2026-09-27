@@ -18,14 +18,42 @@ import (
 var correlationPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 func registerTracing(app core.App, e *core.ServeEvent, cfg Config) error {
-	sink, err := tracing.NewSink(cfg.Tracing)
-	if err != nil {
-		return err
+	var sink *tracing.Sink
+	var buffer *tracing.Buffer
+	if cfg.Tracing.Delivery == "buffer" {
+		buffer = tracing.NewBuffer(cfg.Tracing.MaxBytes)
+		e.Router.GET("/api/context/traces/{request_id}", func(re *core.RequestEvent) error {
+			re.Response.Header().Set("Cache-Control", "no-store")
+			if re.Auth == nil || re.Auth.Collection().Name != cfg.AuthCollection {
+				return re.NotFoundError("Trace not found", nil)
+			}
+			// Bind retrieval to the current token key too, so fresh login after revocation
+			// cannot recover traces belonging to the previous authenticated session.
+			current, err := re.App.FindRecordById(re.Auth.Collection().Id, re.Auth.Id)
+			if err != nil || current.TokenKey() != re.Auth.TokenKey() {
+				return re.NotFoundError("Trace not found", nil)
+			}
+			id := re.Request.PathValue("request_id")
+			if !requestIDPattern.MatchString(id) {
+				return re.NotFoundError("Trace not found", nil)
+			}
+			data, ok := buffer.Get(traceOwner(current), id)
+			if !ok {
+				return re.NotFoundError("Trace not found", nil)
+			}
+			return re.Blob(200, "application/json", data)
+		}).Bind(apis.RequireAuth(cfg.AuthCollection))
+	} else {
+		var err error
+		sink, err = tracing.NewSink(cfg.Tracing)
+		if err != nil {
+			return err
+		}
+		app.OnTerminate().BindFunc(func(te *core.TerminateEvent) error { defer sink.Close(); return te.Next() })
 	}
-	app.OnTerminate().BindFunc(func(te *core.TerminateEvent) error { defer sink.Close(); return te.Next() })
 	var reported atomic.Uint64
 	e.Router.Bind(&hook.Handler[*core.RequestEvent]{Id: "contextTracing", Priority: apis.DefaultLoadAuthTokenMiddlewarePriority - 1, Func: func(re *core.RequestEvent) error {
-		if !strings.HasPrefix(re.Request.URL.Path, "/api/") || re.Request.URL.Path == "/api/health" {
+		if !strings.HasPrefix(re.Request.URL.Path, "/api/") || re.Request.URL.Path == "/api/health" || strings.HasPrefix(re.Request.URL.Path, "/api/context/traces/") || (buffer != nil && re.Request.Header.Get("X-Context-Trace") != "1") {
 			return re.Next()
 		}
 		id := make([]byte, 16)
@@ -61,6 +89,10 @@ func registerTracing(app core.App, e *core.ServeEvent, cfg Config) error {
 			if t.Status == 0 {
 				t.Status = 200
 			}
+			if buffer != nil {
+				buffer.Submit(traceOwner(re.Auth), t)
+				return
+			}
 			sink.Submit(t)
 			if dropped := sink.Dropped.Load(); dropped > reported.Load() {
 				previous := reported.Swap(dropped)
@@ -88,4 +120,10 @@ func traceRoute(pattern string) string {
 		return path
 	}
 	return pattern
+}
+
+var requestIDPattern = regexp.MustCompile(`^[a-f0-9]{32}$`)
+
+func traceOwner(record *core.Record) string {
+	return record.Collection().Id + ":" + record.Id + ":" + record.TokenKey()
 }

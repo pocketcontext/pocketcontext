@@ -17,6 +17,7 @@ var servicePattern = regexp.MustCompile(`^[A-Za-z0-9_.:-]{1,100}$`)
 
 type Config struct {
 	Enabled    bool   `json:"enabled"`
+	Delivery   string `json:"delivery"`
 	Path       string `json:"path"`
 	Service    string `json:"service"`
 	CaptureSQL bool   `json:"captureSql"`
@@ -27,8 +28,14 @@ func (c *Config) Validate() error {
 	if !c.Enabled {
 		return nil
 	}
-	if c.Path == "" || !servicePattern.MatchString(c.Service) {
-		return errors.New("tracing requires path and service (at most 100 bytes)")
+	if c.Delivery == "" {
+		c.Delivery = "file"
+	}
+	if c.Delivery != "file" && c.Delivery != "buffer" {
+		return errors.New("tracing delivery must be file or buffer")
+	}
+	if (c.Delivery == "file" && c.Path == "") || !servicePattern.MatchString(c.Service) {
+		return errors.New("tracing requires service (at most 100 bytes) and file delivery requires path")
 	}
 	if c.MaxBytes == 0 {
 		c.MaxBytes = 16 << 20

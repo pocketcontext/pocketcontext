@@ -178,7 +178,7 @@ func Register(app core.App, configPath string) {
 				return re.BadRequestError("format must be json or csv", nil)
 			}
 			trace := tracing.From(re.Request.Context())
-			if trace != nil && cfg.Tracing.CaptureSQL {
+			if trace != nil && cfg.Tracing.CaptureSQL && (cfg.Tracing.Delivery != "buffer" || re.Request.Header.Get("X-Context-Capture-Sql") == "1") {
 				trace.SQL = body.SQL
 				if len(trace.SQL) > 16384 {
 					trace.SQL = trace.SQL[:16384]
