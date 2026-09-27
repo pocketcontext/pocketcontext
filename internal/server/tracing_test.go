@@ -34,6 +34,10 @@ func TestTracingAuthenticatedRequest(t *testing.T) {
 		t.Fatal(bad.Code)
 	}
 	request(h, "GET", "/api/context/schema", "", "")
+	head := request(h, "HEAD", "/api/context/schema", token, "")
+	if head.Code != 200 {
+		t.Fatal(head.Code)
+	}
 	var traces []tracing.Trace
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -46,12 +50,12 @@ func TestTracingAuthenticatedRequest(t *testing.T) {
 				traces = append(traces, tr)
 			}
 		}
-		if len(traces) >= 2 {
+		if len(traces) >= 3 {
 			break
 		}
 		time.Sleep(time.Millisecond * 10)
 	}
-	if len(traces) != 2 {
+	if len(traces) != 3 {
 		t.Fatalf("traces: %#v", traces)
 	}
 	tr := traces[0]
@@ -60,6 +64,9 @@ func TestTracingAuthenticatedRequest(t *testing.T) {
 	}
 	if traces[1].Status != 400 {
 		t.Fatalf("failure: %#v", traces[1])
+	}
+	if traces[2].Method != "HEAD" || traces[2].Route != "/api/context/schema" || traces[2].Status != 200 {
+		t.Fatalf("HEAD trace: %#v", traces[2])
 	}
 	info, _ := os.Stat(path)
 	if info.Mode().Perm() != 0600 {
@@ -120,5 +127,13 @@ func TestTracingSnapshotAndRESTPrivacy(t *testing.T) {
 	}
 	if tr.Route != "/api/collections/{collection}/records" {
 		t.Fatal(tr.Route)
+	}
+}
+
+func TestTraceRouteMethods(t *testing.T) {
+	for _, pattern := range []string{"GET /api/context/schema", "HEAD /api/context/schema", "/api/context/schema"} {
+		if got := traceRoute(pattern); got != "/api/context/schema" {
+			t.Fatalf("pattern %q: %q", pattern, got)
+		}
 	}
 }

@@ -32,7 +32,7 @@ func registerTracing(app core.App, e *core.ServeEvent, cfg Config) error {
 		if _, err := rand.Read(id); err != nil {
 			return re.Next()
 		}
-		t := &tracing.Trace{Version: 1, RequestID: hex.EncodeToString(id), Service: cfg.Tracing.Service, Method: re.Request.Method, Route: strings.TrimPrefix(re.Request.Pattern, re.Request.Method+" "), StartedAt: time.Now(), Spans: []tracing.Span{}}
+		t := &tracing.Trace{Version: 1, RequestID: hex.EncodeToString(id), Service: cfg.Tracing.Service, Method: re.Request.Method, Route: traceRoute(re.Request.Pattern), StartedAt: time.Now(), Spans: []tracing.Span{}}
 		correlation := re.Request.Header.Get("X-Context-Correlation-Id")
 		if correlationPattern.MatchString(correlation) {
 			t.CorrelationID = correlation
@@ -69,4 +69,12 @@ func registerTracing(app core.App, e *core.ServeEvent, cfg Config) error {
 		return re.Next()
 	}})
 	return nil
+}
+
+// A GET route also matches HEAD; the pattern method need not equal the request method.
+func traceRoute(pattern string) string {
+	if _, path, ok := strings.Cut(pattern, " "); ok {
+		return path
+	}
+	return pattern
 }
