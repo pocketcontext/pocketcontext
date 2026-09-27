@@ -13,13 +13,16 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketcontext/pocketcontext/internal/sqlread"
+	"github.com/pocketcontext/pocketcontext/internal/tracing"
 )
 
 type Config struct {
+	Tracing        tracing.Config          `json:"tracing"`
 	AuthCollection string                  `json:"authCollection"`
 	Tables         map[string][]string     `json:"tables"`
 	TimeoutMS      int                     `json:"timeoutMs"`
@@ -69,6 +72,9 @@ func LoadConfig(path string) (Config, error) {
 			}
 		}
 	}
+	if err := c.Tracing.Validate(); err != nil {
+		return c, err
+	}
 	return c, nil
 }
 
@@ -78,6 +84,11 @@ func Register(app core.App, configPath string) {
 		cfg, err := LoadConfig(configPath)
 		if err != nil {
 			return fmt.Errorf("SQL configuration: %w", err)
+		}
+		if cfg.Tracing.Enabled {
+			if err := registerTracing(app, e, cfg); err != nil {
+				return err
+			}
 		}
 		auth, err := app.FindCollectionByNameOrId(cfg.AuthCollection)
 		if err != nil || !auth.IsAuth() {
@@ -166,8 +177,22 @@ func Register(app core.App, configPath string) {
 			if body.Format != "" && body.Format != "json" && body.Format != "csv" {
 				return re.BadRequestError("format must be json or csv", nil)
 			}
+			trace := tracing.From(re.Request.Context())
+			if trace != nil && cfg.Tracing.CaptureSQL {
+				trace.SQL = body.SQL
+				if len(trace.SQL) > 16384 {
+					trace.SQL = trace.SQL[:16384]
+					for !utf8.ValidString(trace.SQL) {
+						trace.SQL = trace.SQL[:len(trace.SQL)-1]
+					}
+				}
+			}
 			started := time.Now()
 			result, snapshotAt, err := queryFn(re.Request.Context(), re.Auth.Id, body.SQL)
+			if trace != nil {
+				trace.Rows = len(result.Rows)
+				trace.Truncated = result.Truncated
+			}
 			logSQL(app, re, body.SQL, body.Format, started, result, err)
 			if err != nil {
 				if errors.Is(err, sqlread.ErrSnapshotLimit) {
@@ -185,6 +210,7 @@ func Register(app core.App, configPath string) {
 				}
 				return re.BadRequestError("SQL query rejected: "+err.Error(), nil)
 			}
+			encodeDone := tracing.Start(re.Request.Context(), "response.encode")
 			var payload []byte
 			contentType := "application/json"
 			if body.Format == "csv" {
@@ -193,6 +219,7 @@ func Register(app core.App, configPath string) {
 			} else {
 				payload, err = json.Marshal(result)
 			}
+			encodeDone()
 			if err != nil {
 				return re.InternalServerError("Cannot encode query result", nil)
 			}

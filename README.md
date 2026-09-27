@@ -78,3 +78,27 @@ With [filtered snapshots](docs/filtered-snapshots.md), each query runs against a
 Keep config and schema changes under administrative control. SQL authorization captures the configured columns at startup; restart after changing hidden fields or collection definitions. Renaming a collection and creating a new one with the old name keeps the old column allowlist for that name until restart. Error messages distinguish unknown columns from unauthorized ones, so agents can discover the names of hidden fields and unexposed tables, but not their contents. Row limits and timeouts constrain individual queries, not aggregate traffic. Put traffic controls in front of the service when exposing it to a network. Every query is written to the PocketBase log with the agent record id, duration, row count, and SQL text; failed queries log at warning level.
 
 `pb_data` contains application data and credentials and must stay outside Git. PocketBase remains pre-1.0, so review upstream migration notes before upgrading. Back up the application before upgrades and test restores.
+
+## Optional request traces
+
+Enable tracing per application in `pocketcontext.json`:
+
+```json
+"tracing": {
+  "enabled": true,
+  "service": "peoplecontext",
+  "path": "./pb_data/traces.jsonl",
+  "captureSql": false,
+  "maxBytes": 16777216
+}
+```
+
+The parent directory must exist and be private. Trace files use mode 0600; existing public files and symlinks are rejected. Tracing is disabled by default. It records completed authenticated application API requests, including failures, and omits health requests, guests and superusers. Use a separate spool per process; keep tracing disabled on a trace-ingestion service to avoid recursive collection.
+
+Clients may send `X-Context-Correlation-Id` (1–128 ASCII letters, digits, underscores or hyphens). `X-Context-Request-Id` returns an independently generated server request identifier. Identity comes from authentication, never client telemetry. Traces include matched route patterns, method, status, authenticated user ID, start time, elapsed milliseconds, row count, truncation and timing spans. They never contain authorization headers, query-string parameters, REST bodies or query results. Optional SQL capture is capped at 16 KiB and may include sensitive literals; enable it only when the trace audience may read them.
+
+SQL spans measure prepare (including connection-pool waiting), execute, and scan (including SQLite stepping and result accumulation). Filtered queries also measure snapshot capacity waiting, export/build, and reader initialization. Response encoding is measured separately. Authentication is measured around the token-loading middleware. Other REST and HTTP work currently has total request timing, not individual application-hook or transaction spans. Completed traces do not report in-flight progress or network/client elapsed time. Durations are server wall time; phase totals need not exhaust the request duration.
+
+The format is one JSON object per line with `version: 1`, `request_id`, optional `correlation_id`, `service`, `method`, `route`, `started_at`, `duration_ms`, `status`, `user_id`, optional `sql`, `rows`, `truncated`, and `spans`. Each span has `name`, `offset_ms`, and `duration_ms`. An external collector can import these records into a separate application such as ObserveContext through REST; the server has no dependency on that application.
+
+The writer queues at most 256 records and retains the active file plus one `.1` rotation, each up to `maxBytes` (1 MiB–1 GiB). This is bounded diagnostic telemetry, not a durable audit log: queue overflow, file failures, process crashes or an importer falling behind rotation can lose records. Application requests never wait for spool I/O. Drop counts are reported in the PocketBase log on subsequent requests; graceful shutdown drains queued records. Rotate/import within the configured capacity and exclude trace files from source control.

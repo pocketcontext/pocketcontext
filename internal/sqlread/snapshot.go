@@ -13,6 +13,7 @@ import (
 	"time"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
+	"github.com/pocketcontext/pocketcontext/internal/tracing"
 )
 
 // SnapshotConfig is a trusted application policy, never request-supplied SQL.
@@ -197,11 +198,14 @@ func (s *SnapshotSource) Query(ctx context.Context, requester, query string) (Re
 	if s.closed {
 		return Result{}, time.Time{}, ErrSnapshotBuild
 	}
+	waitDone := tracing.Start(ctx, "snapshot.wait")
 	select {
 	case s.slots <- struct{}{}:
 	case <-buildCtx.Done():
+		waitDone()
 		return Result{}, time.Time{}, buildCtx.Err()
 	}
+	waitDone()
 	defer func() { <-s.slots }()
 	dir, err := os.MkdirTemp(s.root, "request-")
 	if err != nil {
@@ -209,7 +213,9 @@ func (s *SnapshotSource) Query(ctx context.Context, requester, query string) (Re
 	}
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "snapshot.db")
+	buildDone := tracing.Start(ctx, "snapshot.build")
 	at, err := s.build(buildCtx, path, requester)
+	buildDone()
 	if err != nil {
 		if buildCtx.Err() != nil {
 			return Result{}, time.Time{}, buildCtx.Err()
@@ -228,7 +234,9 @@ func (s *SnapshotSource) Query(ctx context.Context, requester, query string) (Re
 	if err := ctx.Err(); err != nil {
 		return Result{}, time.Time{}, err
 	}
+	initDone := tracing.Start(ctx, "snapshot.reader_init")
 	engine, err := New(path, s.cfg)
+	initDone()
 	if err != nil {
 		return Result{}, time.Time{}, ErrSnapshotBuild
 	}

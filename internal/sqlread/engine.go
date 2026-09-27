@@ -17,6 +17,7 @@ import (
 	"time"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
+	"github.com/pocketcontext/pocketcontext/internal/tracing"
 )
 
 type Config struct {
@@ -257,7 +258,9 @@ func (e *Engine) Query(ctx context.Context, query string) (Result, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, e.cfg.Timeout)
 	defer cancel()
+	prepareDone := tracing.Start(ctx, "sql.prepare")
 	stmt, err := e.db.PrepareContext(ctx, query)
+	prepareDone()
 	if err != nil {
 		if ctx.Err() != nil {
 			return result, ctx.Err()
@@ -265,7 +268,9 @@ func (e *Engine) Query(ctx context.Context, query string) (Result, error) {
 		return result, classify(err)
 	}
 	defer stmt.Close()
+	executeDone := tracing.Start(ctx, "sql.execute")
 	rows, err := stmt.QueryContext(ctx)
+	executeDone()
 	if err != nil {
 		if ctx.Err() != nil {
 			return result, ctx.Err()
@@ -273,6 +278,8 @@ func (e *Engine) Query(ctx context.Context, query string) (Result, error) {
 		return result, classify(err)
 	}
 	defer rows.Close()
+	scanDone := tracing.Start(ctx, "sql.scan")
+	defer scanDone()
 	result.Columns, err = rows.Columns()
 	if err != nil {
 		return result, err
