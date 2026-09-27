@@ -40,27 +40,38 @@ func registerTracing(app core.App, e *core.ServeEvent, cfg Config) error {
 		re.Request = re.Request.WithContext(tracing.With(re.Request.Context(), t))
 		re.Response.Header().Set("X-Context-Request-Id", t.RequestID)
 		re.Response.Header().Add("Access-Control-Expose-Headers", "X-Context-Request-Id")
-		err := re.Next()
-		if re.Auth == nil || re.Auth.Collection().Name != cfg.AuthCollection {
-			return err
-		}
-		t.UserID = re.Auth.Id
-		t.DurationMS = float64(time.Since(t.StartedAt)) / float64(time.Millisecond)
-		t.Status = re.Status()
-		if !re.Written() && err != nil {
-			t.Status = router.ToApiError(err).Status
-		}
-		if t.Status == 0 {
-			t.Status = 200
-		}
-		sink.Submit(t)
-		if dropped := sink.Dropped.Load(); dropped > reported.Load() {
-			previous := reported.Swap(dropped)
-			if dropped > previous {
-				app.Logger().Warn("context tracing records dropped", "count", dropped)
+		var requestErr error
+		returned := false
+		// Finalize during unwinding without recovering: PocketBase retains its
+		// normal panic handling, including http.ErrAbortHandler propagation.
+		defer func() {
+			if re.Auth == nil || re.Auth.Collection().Name != cfg.AuthCollection {
+				return
 			}
-		}
-		return err
+			t.UserID = re.Auth.Id
+			t.DurationMS = float64(time.Since(t.StartedAt)) / float64(time.Millisecond)
+			t.Status = re.Status()
+			if !re.Written() {
+				if !returned {
+					t.Status = 500
+				} else if requestErr != nil {
+					t.Status = router.ToApiError(requestErr).Status
+				}
+			}
+			if t.Status == 0 {
+				t.Status = 200
+			}
+			sink.Submit(t)
+			if dropped := sink.Dropped.Load(); dropped > reported.Load() {
+				previous := reported.Swap(dropped)
+				if dropped > previous {
+					app.Logger().Warn("context tracing records dropped", "count", dropped)
+				}
+			}
+		}()
+		requestErr = re.Next()
+		returned = true
+		return requestErr
 	}})
 	e.Router.Bind(&hook.Handler[*core.RequestEvent]{Id: "contextTraceAuth", Priority: apis.DefaultLoadAuthTokenMiddlewarePriority + 1, Func: func(re *core.RequestEvent) error {
 		if t := tracing.From(re.Request.Context()); t != nil {

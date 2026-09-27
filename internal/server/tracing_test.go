@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pocketbase/pocketbase/apis"
+	"github.com/pocketbase/pocketbase/core"
 	"github.com/pocketcontext/pocketcontext/internal/tracing"
 )
 
@@ -135,5 +137,50 @@ func TestTraceRouteMethods(t *testing.T) {
 		if got := traceRoute(pattern); got != "/api/context/schema" {
 			t.Fatalf("pattern %q: %q", pattern, got)
 		}
+	}
+}
+
+func TestTracingRecoveredPanic(t *testing.T) {
+	app, token, _ := fixture(t)
+	app.OnServe().BindFunc(func(e *core.ServeEvent) error {
+		e.Router.GET("/api/panic-test", func(re *core.RequestEvent) error { panic("private-panic-value") }).Bind(apis.RequireAuth("agents"))
+		return e.Next()
+	})
+	path := filepath.Join(t.TempDir(), "traces.jsonl")
+	cfg := Config{AuthCollection: "agents", Tables: map[string][]string{"deals": {"id", "title"}}, TimeoutMS: 1000, MaxRows: 100, MaxBytes: 4096, Tracing: tracing.Config{Enabled: true, Path: path, Service: "test"}}
+	h, err := startConfiguredRouter(t, app, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := request(h, "GET", "/api/panic-test", token, "")
+	if response.Code != 500 {
+		t.Fatalf("panic response %d", response.Code)
+	}
+	// The panic must still pass to PocketBase's normal recovery and leave the router usable.
+	if again := request(h, "GET", "/api/context/schema", token, ""); again.Code != 200 {
+		t.Fatal(again.Code)
+	}
+	var data []byte
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		data, _ = os.ReadFile(path)
+		if strings.Count(string(data), "\n") >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 2 {
+		t.Fatal(string(data))
+	}
+	var tr tracing.Trace
+	if err := json.Unmarshal([]byte(lines[0]), &tr); err != nil {
+		t.Fatal(err)
+	}
+	if tr.Status != 500 || tr.UserID == "" || tr.Route != "/api/panic-test" || tr.DurationMS <= 0 {
+		t.Fatalf("panic trace %#v", tr)
+	}
+	if strings.Contains(string(data), "private-panic-value") {
+		t.Fatal("panic contents leaked into trace")
 	}
 }
