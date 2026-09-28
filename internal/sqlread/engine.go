@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"path/filepath"
 	"sort"
@@ -56,6 +57,7 @@ type connector struct {
 	driver       *sqlite3.SQLiteDriver
 	dsn          string
 	transactions bool
+	authorize    func(int, string, string, string) int
 }
 
 func (c connector) Connect(context.Context) (driver.Conn, error) {
@@ -63,7 +65,17 @@ func (c connector) Connect(context.Context) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return roConn{c: conn.(*sqlite3.SQLiteConn), transactions: c.transactions}, nil
+	sqliteConn := conn.(*sqlite3.SQLiteConn)
+	// database/sql serializes each connection, including Conn.Raw. Keep the
+	// callback registered once: re-registering would retain driver handles.
+	trusted := new(bool)
+	sqliteConn.RegisterAuthorizer(func(op int, a, b, db string) int {
+		if *trusted {
+			return sqlite3.SQLITE_OK
+		}
+		return c.authorize(op, a, b, db)
+	})
+	return roConn{c: sqliteConn, transactions: c.transactions, trusted: trusted}, nil
 }
 func (c connector) Driver() driver.Driver { return c.driver }
 
@@ -72,6 +84,7 @@ func (c connector) Driver() driver.Driver { return c.driver }
 type roConn struct {
 	c            *sqlite3.SQLiteConn
 	transactions bool
+	trusted      *bool
 }
 
 func (r roConn) Close() error                   { return r.c.Close() }
@@ -185,6 +198,30 @@ func newEngine(path string, cfg Config, transactions bool) (*Engine, error) {
 		e.tables = append(e.tables, table)
 	}
 	sort.Slice(e.tables, func(i, j int) bool { return e.tables[i].Name < e.tables[j].Name })
+	authorize := func(op int, a, b, db string) int {
+		switch op {
+		case sqlite3.SQLITE_TRANSACTION:
+			if transactions {
+				return sqlite3.SQLITE_OK
+			}
+		case sqlite3.SQLITE_SELECT, 33: // SQLITE_RECURSIVE
+			return sqlite3.SQLITE_OK
+		case sqlite3.SQLITE_READ:
+			if !transactions && jsonTableColumn(a, b) && (db == "main" || (db == "" && b == "")) {
+				return sqlite3.SQLITE_OK
+			}
+			// SQLite may omit database identity for optimized COUNT(*) reads.
+			columns, ok := allowed[strings.ToLower(a)]
+			if ok && ((db == "main" && columns[strings.ToLower(b)]) || (b == "" && (db == "main" || db == ""))) {
+				return sqlite3.SQLITE_OK
+			}
+		case sqlite3.SQLITE_FUNCTION:
+			if safeFunctions[strings.ToLower(b)] {
+				return sqlite3.SQLITE_OK
+			}
+		}
+		return sqlite3.SQLITE_DENY
+	}
 	d := &sqlite3.SQLiteDriver{ConnectHook: func(c *sqlite3.SQLiteConn) error {
 		if _, err := c.Exec("PRAGMA query_only = 1; PRAGMA hard_heap_limit = 268435456;", nil); err != nil {
 			return err
@@ -195,30 +232,9 @@ func newEngine(path string, cfg Config, transactions bool) (*Engine, error) {
 		c.SetLimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH, 100)
 		c.SetLimit(sqlite3.SQLITE_LIMIT_COMPOUND_SELECT, 50)
 		c.SetLimit(sqlite3.SQLITE_LIMIT_ATTACHED, 0)
-		c.RegisterAuthorizer(func(op int, a, b, db string) int {
-			switch op {
-			case sqlite3.SQLITE_TRANSACTION:
-				if transactions {
-					return sqlite3.SQLITE_OK
-				}
-			case sqlite3.SQLITE_SELECT, 33:
-				return sqlite3.SQLITE_OK // SQLITE_RECURSIVE
-			case sqlite3.SQLITE_READ:
-				columns, ok := allowed[strings.ToLower(a)]
-				// SQLite may omit the database name for optimized COUNT(*) reads.
-				if ok && ((db == "main" && columns[strings.ToLower(b)]) || (b == "" && (db == "main" || db == ""))) {
-					return sqlite3.SQLITE_OK
-				}
-			case sqlite3.SQLITE_FUNCTION:
-				if safeFunctions[strings.ToLower(b)] {
-					return sqlite3.SQLITE_OK
-				}
-			}
-			return sqlite3.SQLITE_DENY
-		})
 		return nil
 	}}
-	e.db = sql.OpenDB(connector{driver: d, dsn: u.String(), transactions: transactions})
+	e.db = sql.OpenDB(connector{driver: d, dsn: u.String(), transactions: transactions, authorize: authorize})
 	e.db.SetMaxOpenConns(4)
 	e.db.SetMaxIdleConns(4)
 	if err = e.db.PingContext(ctx); err != nil {
@@ -259,7 +275,60 @@ func (e *Engine) Query(ctx context.Context, query string) (Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, e.cfg.Timeout)
 	defer cancel()
 	prepareDone := tracing.Start(ctx, "sql.prepare")
-	stmt, err := e.db.PrepareContext(ctx, query)
+	conn, err := e.db.Conn(ctx)
+	if err != nil {
+		prepareDone()
+		return result, classify(err)
+	}
+	defer conn.Close()
+	var tx driver.Tx
+	defer func() {
+		if tx != nil {
+			conn.Raw(func(raw any) error {
+				r := raw.(roConn)
+				*r.trusted = true
+				defer func() { *r.trusted = false }()
+				if err := tx.Rollback(); err != nil {
+					return driver.ErrBadConn
+				}
+				return nil
+			})
+		}
+	}()
+	err = conn.Raw(func(raw any) error {
+		r := raw.(roConn)
+		*r.trusted = true
+		defer func() { *r.trusted = false }()
+		var err error
+		tx, err = r.c.Begin()
+		if err != nil {
+			return err
+		}
+		// This read pins the schema and data until user rows are closed. A later
+		// schema change cannot turn a built-in JSON module into a private table.
+		rows, err := r.c.QueryContext(ctx, "SELECT name FROM sqlite_schema WHERE lower(name) IN ('json_each','json_tree') LIMIT 1", nil)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		values := make([]driver.Value, 1)
+		if err = rows.Next(values); err == nil {
+			return errors.New("json_each and json_tree are reserved SQL module names")
+		}
+		if err != io.EOF {
+			return err
+		}
+		return nil
+	})
+
+	if err != nil {
+		prepareDone()
+		if ctx.Err() != nil {
+			return result, ctx.Err()
+		}
+		return result, classify(err)
+	}
+	stmt, err := conn.PrepareContext(ctx, query)
 	prepareDone()
 	if err != nil {
 		if ctx.Err() != nil {
@@ -362,7 +431,7 @@ func (r Result) CSV() ([]byte, error) {
 
 var safeFunctions = func() map[string]bool {
 	m := map[string]bool{}
-	for _, s := range strings.Fields(`abs avg ceiling ceil char coalesce concat concat_ws count date datetime exp floor format glob group_concat hex ifnull iif instr json json_array json_array_length json_extract json_group_array json_group_object json_object json_quote json_type json_valid julianday length like ln log log10 log2 lower ltrim max min mod nullif octet_length pi pow power printf quote replace round rtrim sign sqrt strftime string_agg substr substring sum time timediff total trim typeof unicode unixepoch upper row_number rank dense_rank percent_rank cume_dist ntile lag lead first_value last_value nth_value -> ->>`) {
+	for _, s := range strings.Fields(`abs avg ceiling ceil char coalesce concat concat_ws count date datetime exp floor format glob group_concat hex ifnull iif instr json json_array json_array_length json_extract json_group_array json_group_object json_object json_quote json_type json_valid julianday length like ln log log10 log2 lower ltrim max median min mod percentile percentile_cont percentile_disc nullif octet_length pi pow power printf quote replace round rtrim sign sqrt strftime string_agg substr substring sum time timediff total trim typeof unicode unixepoch upper row_number rank dense_rank percent_rank cume_dist ntile lag lead first_value last_value nth_value -> ->>`) {
 		m[s] = true
 	}
 	return m
@@ -435,4 +504,19 @@ func singleStatement(s string) error {
 		return errors.New("SQL statement is empty")
 	}
 	return nil
+}
+
+// Only the fixed columns of SQLite's two built-in JSON traversal modules are
+// exposed. Inputs still pass ordinary source table/column authorization.
+func jsonTableColumn(table, column string) bool {
+	switch strings.ToLower(table) {
+	case "json_each", "json_tree":
+	default:
+		return false
+	}
+	switch strings.ToLower(column) {
+	case "", "key", "value", "type", "atom", "id", "parent", "fullkey", "path", "json", "root":
+		return true
+	}
+	return false
 }

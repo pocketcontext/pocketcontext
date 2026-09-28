@@ -6,7 +6,7 @@ The server embeds PocketBase v0.40.4. By default, a separate read-only SQLite co
 
 ## Build
 
-You need Go 1.27 or later and a C compiler. The SQL reader uses `github.com/mattn/go-sqlite3` for its SQLite authorizer. PocketBase's write connections use the same SQLite library to share its process-local locking state. Agent reads use separate connections opened read-only. Build and test with the `sqlite_math_functions` tag, as the Makefile does; without it SQLite lacks math functions such as `sqrt` and `ceil`, so `go test ./...` fails.
+You need Go 1.27 or later and a C compiler. The SQL reader uses `github.com/mattn/go-sqlite3` for its SQLite authorizer. PocketBase's write connections use the same SQLite library to share its process-local locking state. Agent reads use separate connections opened read-only. Build and test with the `sqlite_math_functions` and `sqlite_percentile` tags, as the Makefile does; without them SQLite lacks the supported math and percentile functions, so plain `go test ./...` fails.
 
 ```sh
 make test
@@ -59,11 +59,33 @@ curl -sS http://127.0.0.1:8090/api/context/query \
 
 JSON responses contain `columns`, positional `rows`, and `truncated`. Request `"format":"csv"` for CSV. Both formats return `X-Context-Truncated`. A truncated response is incomplete. Narrow the query or request another page using a stable ordering. CSV represents NULL as an empty field; use JSON when that distinction matters.
 
-The reader supports joins, aggregates, CTEs, and common SQLite functions. It accepts one statement, with an optional trailing semicolon. It denies writes, schema changes, transactions, PRAGMAs, attachments, metadata reads, and functions outside its allowlist. It also rejects, before running it, any statement that SQLite does not report as read-only, such as `VACUUM` and `VACUUM INTO`. Views and virtual tables are not currently configurable; query the allowed base tables with joins or CTEs. SQLite can omit database identity in authorization callbacks for `COUNT(*)` over a CTE, so the reader may reject that form. Use `COUNT(cte.column)` when the column is non-null, or aggregate from the base table.
+The reader supports joins, aggregates, CTEs, and common SQLite functions. It accepts one statement, with an optional trailing semicolon. It denies writes, schema changes, transactions, PRAGMAs, attachments, metadata reads, and functions outside its allowlist. It also rejects, before running it, any statement that SQLite does not report as read-only, such as `VACUUM` and `VACUUM INTO`. Views and virtual tables are not configurable; the built-in `json_each` and `json_tree` table-valued functions are narrowly supported as described below. SQLite can omit database identity in authorization callbacks for `COUNT(*)` over a CTE, so the reader may reject that form. Use `COUNT(cte.column)` when the column is non-null, or aggregate from the base table.
 
 The default limits are two seconds, 500 rows, and 1 MiB of encoded results. The HTTP request limit is 64 KiB. The reader also limits SQLite scalar allocation sizes and sets a process-wide SQLite heap cap of 256 MiB, shared with PocketBase and snapshot construction. Queries that exceed a row or accumulated result limit return partial results with `truncated: true`. Oversized SQLite values and invalid or unauthorized SQL return 400. Expired query deadlines return 408. CSV or JSON encoding that exceeds the final response cap returns 413. A busy database returns 503 with `Retry-After`; retry the same query.
 
 The reader uses at most four connections. Additional concurrent queries wait for a connection and return 408 if none becomes free before the deadline. `EXPLAIN` and `EXPLAIN QUERY PLAN` are permitted for allowed tables and reveal index names and page numbers, not data.
+
+### JSON traversal and distributions
+
+`json_each(value[, path])` expands one level of a JSON array or object; `json_tree(value[, path])` recursively expands it. Inputs may be literals, expressions or authorized columns. Source-table and column permissions still apply, including inside subqueries. Neither function grants access to auth records, hidden columns, metadata or other virtual tables. In filtered mode they see only the exported snapshot.
+
+`json_each` and `json_tree` are reserved schema-object names. A database object with either name, regardless of case, causes query rejection. Each agent query uses an internal read transaction to check these names and keep that schema stable until its results are closed; agents still cannot issue transaction commands. This adds a schema check and transaction setup/cleanup to each query. Snapshot export-policy expressions do not gain these table-valued functions; traversal is enabled only on the completed requester snapshot.
+
+For an application exposing a JSON `measurements` column on `documents`:
+
+```sql
+SELECT d.id, j.value
+FROM documents AS d, json_each(d.measurements, '$.durations') AS j;
+
+SELECT median(j.value), percentile_cont(j.value, 0.95)
+FROM documents AS d, json_each(d.measurements, '$.durations') AS j;
+```
+
+Supported distribution functions are `median(value)`, `percentile(value, p)` with `p` from 0 to 100, and `percentile_cont(value, p)` / `percentile_disc(value, p)` with `p` from 0 to 1. Continuous percentiles interpolate between values; discrete percentiles choose the lower adjacent observed value. NULL inputs are ignored, an empty population returns NULL, and nonnumeric non-NULL inputs are rejected. The percentile argument must be constant within each group. Results describe only the rows visible to the requester. The SQL-standard `WITHIN GROUP` syntax is not enabled.
+
+JSON expansion and aggregates can process substantially more rows than they return. Percentile aggregates use memory proportional to their input and sort those values. Output limits do not bound aggregate input; query deadlines and the shared SQLite heap cap still apply. Prefer bounded input ranges for large datasets.
+
+FTS5 remains disabled in the production build. See the [FTS5 design and prototype findings](docs/fts5-design.md) for the proposed separate search surface and remaining implementation work.
 
 ## Write through PocketBase
 
