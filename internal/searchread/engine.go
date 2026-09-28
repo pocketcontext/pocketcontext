@@ -3,16 +3,19 @@ package searchread
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"net/url"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -21,28 +24,51 @@ import (
 )
 
 const (
-	MaxQueryBytes = 4096
-	MaxTerms      = 16
-	MaxLimit      = 100
-	DefaultLimit  = 20
+	MaxQueryBytes   = 4096
+	MaxTerms        = 16
+	MaxLimit        = 100
+	DefaultLimit    = 20
+	MaxScopeMembers = 10000
+	MaxOffset       = 10000
+	MaxScopeBytes   = 4 << 20
 )
 
 var (
-	ErrInvalidQuery  = errors.New("invalid search request")
-	ErrIndexInvalid  = errors.New("search index is invalid")
-	ErrBusy          = errors.New("search database busy")
-	ErrResponseLimit = errors.New("search response exceeds byte limit")
+	ErrGenerationConflict = errors.New("search generation changed")
+	ErrInvalidQuery       = errors.New("invalid search request")
+	ErrIndexInvalid       = errors.New("search index is invalid")
+	ErrBusy               = errors.New("search database busy")
+	ErrResponseLimit      = errors.New("search response exceeds byte limit")
 )
 
 type Config struct {
 	Indexes map[string]Index `json:"indexes"`
 }
+type Scope struct {
+	Collection string `json:"collection"`
+	Field      string `json:"field"`
+}
+type Generation struct {
+	Collection string `json:"collection"`
+	Record     string `json:"record"`
+	Field      string `json:"field"`
+}
+type Request struct {
+	Index              string `json:"index"`
+	Query              string `json:"query"`
+	Limit              int    `json:"limit"`
+	Scope              string `json:"scope,omitempty"`
+	Offset             int    `json:"offset,omitempty"`
+	ExpectedGeneration string `json:"expectedGeneration,omitempty"`
+}
 type Index struct {
-	Table         string    `json:"table"`
-	Collection    string    `json:"collection"`
-	Columns       []string  `json:"columns"`
-	SnippetColumn string    `json:"snippetColumn"`
-	Weights       []float64 `json:"weights,omitempty"`
+	Scope         *Scope      `json:"scope,omitempty"`
+	Generation    *Generation `json:"generation,omitempty"`
+	Table         string      `json:"table"`
+	Collection    string      `json:"collection"`
+	Columns       []string    `json:"columns"`
+	SnippetColumn string      `json:"snippetColumn"`
+	Weights       []float64   `json:"weights,omitempty"`
 }
 type Limits struct {
 	Timeout           time.Duration
@@ -54,9 +80,12 @@ type Hit struct {
 	Excerpt string  `json:"excerpt"`
 }
 type Result struct {
-	Index     string `json:"index"`
-	Hits      []Hit  `json:"hits"`
-	Truncated bool   `json:"truncated"`
+	Scope      string `json:"scope,omitempty"`
+	Generation string `json:"generation,omitempty"`
+	HasMore    bool   `json:"hasMore"`
+	Index      string `json:"index"`
+	Hits       []Hit  `json:"hits"`
+	Truncated  bool   `json:"truncated"`
 }
 type definition struct {
 	index            Index
@@ -79,6 +108,12 @@ func quote(s string) string { return `"` + s + `"` }
 // CanonicalDDL returns the only accepted index shape. Applications execute this
 // DDL through trusted migrations, then maintain index rows transactionally.
 func CanonicalDDL(i Index) (string, error) {
+	if (i.Scope == nil) != (i.Generation == nil) {
+		return "", ErrIndexInvalid
+	}
+	if i.Scope != nil && (!validName(i.Scope.Collection) || !validName(i.Scope.Field) || !validName(i.Generation.Collection) || !validName(i.Generation.Field) || !validToken(i.Generation.Record)) {
+		return "", ErrIndexInvalid
+	}
 	if !validName(i.Table) || !validName(i.Collection) || strings.EqualFold(i.Table, i.Collection) || len(i.Columns) == 0 || len(i.Columns) > 16 {
 		return "", fmt.Errorf("%w: index identifiers or column count", ErrIndexInvalid)
 	}
@@ -128,8 +163,8 @@ func (c connector) Connect(ctx context.Context) (driver.Conn, error) {
 	if _, err = db.Exec("PRAGMA query_only=1; PRAGMA hard_heap_limit=268435456", nil); err != nil {
 		return fail(err)
 	}
-	// Metadata DDL needs a small fixed allowance even with tiny response caps.
-	db.SetLimit(sqlite3.SQLITE_LIMIT_LENGTH, max(c.maxBytes, 65536))
+	// Scope documents have a separate bounded allowance even with tiny response caps.
+	db.SetLimit(sqlite3.SQLITE_LIMIT_LENGTH, max(c.maxBytes, MaxScopeBytes))
 	db.SetLimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, 65536)
 	db.SetLimit(sqlite3.SQLITE_LIMIT_COLUMN, 256)
 	db.SetLimit(sqlite3.SQLITE_LIMIT_EXPR_DEPTH, 100)
@@ -220,6 +255,7 @@ func New(path string, cfg Config, limits Limits) (*Engine, error) {
 	defer expected.Close()
 	expected.SetMaxOpenConns(1)
 	allowed := map[string]map[string]bool{"sqlite_master": {"type": true, "name": true, "sql": true}, "sqlite_schema": {"type": true, "name": true, "sql": true}}
+	allowed["json_each"] = map[string]bool{"value": true, "json": true}
 	tableNames := map[string]bool{}
 	aliases := make([]string, 0, len(cfg.Indexes))
 	for alias := range cfg.Indexes {
@@ -228,6 +264,14 @@ func New(path string, cfg Config, limits Limits) (*Engine, error) {
 	sort.Strings(aliases)
 	for _, alias := range aliases {
 		idx := cfg.Indexes[alias]
+		if idx.Scope != nil {
+			copied := *idx.Scope
+			idx.Scope = &copied
+		}
+		if idx.Generation != nil {
+			copied := *idx.Generation
+			idx.Generation = &copied
+		}
 		idx.Columns = append([]string(nil), idx.Columns...)
 		idx.Weights = append([]float64(nil), idx.Weights...)
 		ddl, err := CanonicalDDL(idx)
@@ -278,6 +322,16 @@ func New(path string, cfg Config, limits Limits) (*Engine, error) {
 			allowed[source] = map[string]bool{}
 		}
 		allowed[source]["id"] = true
+		if idx.Scope != nil {
+			for _, pair := range [][2]string{{idx.Scope.Collection, idx.Scope.Field}, {idx.Generation.Collection, idx.Generation.Field}} {
+				name := strings.ToLower(pair[0])
+				if allowed[name] == nil {
+					allowed[name] = map[string]bool{}
+				}
+				allowed[name]["id"] = true
+				allowed[name][strings.ToLower(pair[1])] = true
+			}
+		}
 		weights := []string{"0"}
 		snip := 0
 		for n, c := range idx.Columns {
@@ -292,6 +346,9 @@ func New(path string, cfg Config, limits Limits) (*Engine, error) {
 		}
 		table := quote(idx.Table)
 		search := "SELECT record_id, bm25(" + table + "," + strings.Join(weights, ",") + "), snippet(" + table + fmt.Sprintf(",%d,'','',' … ',32) FROM ", snip) + table + " WHERE " + table + " MATCH ? ORDER BY 2, record_id LIMIT ?"
+		if idx.Scope != nil {
+			search = strings.Replace(search, " ORDER BY", " AND record_id IN (SELECT value FROM json_each(?)) ORDER BY", 1) + " OFFSET ?"
+		}
 		// Canonical FTS DDL and exact shadow DDL establish that _content.c0
 		// stores record_id. Validate the same corpus directly, avoiding FTS's
 		// per-row content lookup during an otherwise unindexed virtual-table scan.
@@ -304,7 +361,7 @@ func New(path string, cfg Config, limits Limits) (*Engine, error) {
 	for _, def := range e.indexes {
 		for _, other := range e.indexes {
 			for name := range def.schema {
-				if strings.EqualFold(name, other.index.Collection) {
+				if strings.EqualFold(name, other.index.Collection) || (other.index.Scope != nil && (strings.EqualFold(name, other.index.Scope.Collection) || strings.EqualFold(name, other.index.Generation.Collection))) {
 					return nil, fmt.Errorf("%w: source/index name collision", ErrIndexInvalid)
 				}
 			}
@@ -324,12 +381,12 @@ func New(path string, cfg Config, limits Limits) (*Engine, error) {
 		case sqlite3.SQLITE_SELECT, sqlite3.SQLITE_TRANSACTION:
 			return sqlite3.SQLITE_OK
 		case sqlite3.SQLITE_READ:
-			if (db == "main" || (db == "" && b == "")) && allowed[strings.ToLower(a)][strings.ToLower(b)] {
+			if (db == "main" || (db == "" && (b == "" || strings.EqualFold(a, "json_each")))) && allowed[strings.ToLower(a)][strings.ToLower(b)] {
 				return sqlite3.SQLITE_OK
 			}
 		case sqlite3.SQLITE_FUNCTION:
 			switch strings.ToLower(b) {
-			case "match", "bm25", "snippet", "typeof", "length", "trim", "count", "pocketcontext_utf8_valid":
+			case "match", "bm25", "snippet", "typeof", "length", "trim", "count", "pocketcontext_utf8_valid", "lower":
 				return sqlite3.SQLITE_OK
 			}
 		case sqlite3.SQLITE_PRAGMA:
@@ -361,14 +418,26 @@ func New(path string, cfg Config, limits Limits) (*Engine, error) {
 }
 func (e *Engine) Close() error { return e.db.Close() }
 func (e *Engine) validate(ctx context.Context, tx *sql.Tx, d definition) error {
-	var sourceDDL string
-	if err := tx.QueryRowContext(ctx, "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?", d.index.Collection).Scan(&sourceDDL); err != nil {
-		return fmt.Errorf("%w: source schema unavailable: %w", ErrIndexInvalid, err)
+	var reserved int
+	if err := tx.QueryRowContext(ctx, "SELECT count(*) FROM sqlite_schema WHERE lower(name)='json_each'").Scan(&reserved); err != nil {
+		return fmt.Errorf("%w: schema unavailable: %w", ErrIndexInvalid, err)
 	}
-	if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sourceDDL)), "CREATE TABLE") {
-		return fmt.Errorf("%w: source must be an ordinary table", ErrIndexInvalid)
+	if reserved != 0 {
+		return ErrIndexInvalid
 	}
-
+	sources := []string{d.index.Collection}
+	if d.index.Scope != nil {
+		sources = append(sources, d.index.Scope.Collection, d.index.Generation.Collection)
+	}
+	for _, source := range sources {
+		var sourceDDL string
+		if err := tx.QueryRowContext(ctx, "SELECT sql FROM sqlite_schema WHERE type='table' AND name=?", source).Scan(&sourceDDL); err != nil {
+			return fmt.Errorf("%w: source schema unavailable: %w", ErrIndexInvalid, err)
+		}
+		if !strings.HasPrefix(strings.ToUpper(strings.TrimSpace(sourceDDL)), "CREATE TABLE") {
+			return fmt.Errorf("%w: source must be an ordinary table", ErrIndexInvalid)
+		}
+	}
 	names := make([]string, 0, len(d.schema))
 	for name := range d.schema {
 		names = append(names, name)
@@ -394,10 +463,21 @@ func (e *Engine) validate(ctx context.Context, tx *sql.Tx, d definition) error {
 	return nil
 }
 func (e *Engine) Search(ctx context.Context, index, query string, limit int) (Result, error) {
+	return e.SearchRequest(ctx, Request{Index: index, Query: query, Limit: limit})
+}
+func (e *Engine) SearchRequest(ctx context.Context, req Request) (Result, error) {
+	index, query, limit := req.Index, req.Query, req.Limit
 	result := Result{Index: index, Hits: []Hit{}}
 	d, ok := e.indexes[index]
 	if !ok {
 		return result, fmt.Errorf("%w: unknown index", ErrInvalidQuery)
+	}
+	if d.index.Scope == nil {
+		if req.Scope != "" || req.Offset != 0 || req.ExpectedGeneration != "" {
+			return result, ErrInvalidQuery
+		}
+	} else if !validToken(req.Scope) || req.Offset < 0 || req.Offset > MaxOffset || (req.Offset > 0 && req.ExpectedGeneration == "") || (req.ExpectedGeneration != "" && !validToken(req.ExpectedGeneration)) {
+		return result, ErrInvalidQuery
 	}
 	if len(query) > MaxQueryBytes || !utf8.ValidString(query) || strings.IndexByte(query, 0) >= 0 {
 		return result, ErrInvalidQuery
@@ -428,7 +508,25 @@ func (e *Engine) Search(ctx context.Context, index, query string, limit int) (Re
 		}
 		return result, classify(err)
 	}
-	rows, err := tx.QueryContext(ctx, d.search, strings.Join(terms, " AND "), limit+1)
+	args := []any{strings.Join(terms, " AND ")}
+	if d.index.Scope != nil {
+		membership, generation, err := readScope(ctx, tx, d.index, req.Scope)
+		if err != nil {
+			if ctx.Err() != nil {
+				return result, ctx.Err()
+			}
+			return result, classify(err)
+		}
+		generation = exposedGeneration(d.index, generation, req.Scope, membership)
+		if req.ExpectedGeneration != "" && req.ExpectedGeneration != generation {
+			return result, ErrGenerationConflict
+		}
+		result.Scope, result.Generation = req.Scope, generation
+		args = append(args, membership, limit+1, req.Offset)
+	} else {
+		args = append(args, limit+1)
+	}
+	rows, err := tx.QueryContext(ctx, d.search, args...)
 	if err != nil {
 		if ctx.Err() != nil {
 			return result, ctx.Err()
@@ -439,6 +537,7 @@ func (e *Engine) Search(ctx context.Context, index, query string, limit int) (Re
 	for rows.Next() {
 		if len(result.Hits) == limit {
 			result.Truncated = true
+			result.HasMore = true
 			break
 		}
 		var hit Hit
@@ -473,4 +572,121 @@ func (e *Engine) Search(ctx context.Context, index, query string, limit int) (Re
 		return Result{}, ErrResponseLimit
 	}
 	return result, nil
+}
+
+func validToken(s string) bool {
+	return len(s) > 0 && len(s) <= 128 && utf8.ValidString(s) && strings.TrimSpace(s) != "" && !strings.ContainsRune(s, 0)
+}
+
+// Decode token-by-token so duplicate JSON object keys cannot disappear silently.
+func scopeMembers(raw string) ([]string, error) {
+	if len(raw) > MaxScopeBytes || !utf8.ValidString(raw) || !validJSONEscapes(raw) {
+		return nil, ErrIndexInvalid
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	start, err := dec.Token()
+	if err != nil || start != json.Delim('{') {
+		return nil, ErrIndexInvalid
+	}
+	keys := map[string]bool{}
+	values := []string{}
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return nil, ErrIndexInvalid
+		}
+		k, ok := key.(string)
+		if !ok || !validToken(k) || keys[k] || len(keys) >= MaxScopeMembers {
+			return nil, ErrIndexInvalid
+		}
+		keys[k] = true
+		var v string
+		if err := dec.Decode(&v); err != nil || !validToken(v) {
+			return nil, ErrIndexInvalid
+		}
+		values = append(values, v)
+	}
+	if end, err := dec.Token(); err != nil || end != json.Delim('}') {
+		return nil, ErrIndexInvalid
+	}
+	if dec.Decode(new(any)) != io.EOF {
+		return nil, ErrIndexInvalid
+	}
+	return values, nil
+}
+func readScope(ctx context.Context, tx *sql.Tx, idx Index, scope string) (string, string, error) {
+	var raw, generation, generationType string
+	if err := tx.QueryRowContext(ctx, "SELECT "+quote(idx.Scope.Field)+" FROM "+quote(idx.Scope.Collection)+" WHERE id=?", scope).Scan(&raw); err != nil {
+		return "", "", fmt.Errorf("%w: scope unavailable: %w", ErrIndexInvalid, err)
+	}
+	values, err := scopeMembers(raw)
+	if err != nil {
+		return "", "", err
+	}
+	if err = tx.QueryRowContext(ctx, "SELECT "+quote(idx.Generation.Field)+", typeof("+quote(idx.Generation.Field)+") FROM "+quote(idx.Generation.Collection)+" WHERE id=?", idx.Generation.Record).Scan(&generation, &generationType); err != nil {
+		return "", "", fmt.Errorf("%w: generation unavailable: %w", ErrIndexInvalid, err)
+	}
+	if generationType != "text" || !validToken(generation) {
+		return "", "", ErrIndexInvalid
+	}
+	sort.Strings(values)
+	data, _ := json.Marshal(values)
+	var missing int
+	err = tx.QueryRowContext(ctx, "SELECT count(*) FROM json_each(?) WHERE NOT EXISTS (SELECT 1 FROM "+quote(idx.Collection)+" WHERE id=json_each.value)", string(data)).Scan(&missing)
+	if err != nil {
+		return "", "", err
+	}
+	if missing != 0 {
+		return "", "", ErrIndexInvalid
+	}
+	return string(data), generation, nil
+}
+
+// encoding/json replaces unpaired UTF-16 escapes with U+FFFD. Reject them
+// instead: corrupted membership must not select an actual replacement-character ID.
+func validJSONEscapes(raw string) bool {
+	for i := 0; i < len(raw); i++ {
+		if raw[i] != '\\' {
+			continue
+		}
+		i++
+		if i >= len(raw) {
+			return false
+		}
+		if raw[i] != 'u' {
+			continue
+		}
+		if i+4 >= len(raw) {
+			return false
+		}
+		code, err := strconv.ParseUint(raw[i+1:i+5], 16, 16)
+		if err != nil {
+			return false
+		}
+		i += 4
+		if code >= 0xd800 && code <= 0xdbff {
+			if i+6 >= len(raw) || raw[i+1:i+3] != `\u` {
+				return false
+			}
+			low, err := strconv.ParseUint(raw[i+3:i+7], 16, 16)
+			if err != nil || low < 0xdc00 || low > 0xdfff {
+				return false
+			}
+			i += 6
+		} else if code >= 0xdc00 && code <= 0xdfff {
+			return false
+		}
+	}
+	return true
+}
+
+// Bump this contract version whenever ranking or query semantics change. The
+// token is a consistency fingerprint, not an authorization credential or MAC.
+const rankingContractVersion = "literal-and-bm25-id-v1"
+
+func exposedGeneration(idx Index, raw, scope, membership string) string {
+	version, number, source := sqlite3.Version()
+	data, _ := json.Marshal([]any{rankingContractVersion, version, number, source, idx, raw, scope, membership})
+	digest := sha256.Sum256(data)
+	return fmt.Sprintf("%x", digest)
 }

@@ -69,14 +69,15 @@ curl -sS http://127.0.0.1:8090/api/context/search \
   --data '{"index":"documents","query":"deployment safety","limit":20}'
 ```
 
-The request accepts only `index`, `query` and optional `limit`. The default limit
+Unscoped indexes accept `index`, `query` and optional `limit`. The default limit
 is 20, bounded by the application's `maxRows`; the maximum is the smaller of
 100 and `maxRows`. Query text is limited to 4096 UTF-8 bytes and 16
 whitespace-separated terms. Terms become quoted FTS phrases combined with AND.
 Words such as `OR` are literal terms, not query operators; SQL, raw FTS syntax,
 client-selected columns and ranking expressions are not accepted.
 
-The response contains `index`, `hits` and `truncated`. Each hit has `id`, `score`
+The response contains `index`, `hits`, `truncated` and `hasMore`. The latter two
+are equal and indicate that at least one additional matching hit exists. Each hit has `id`, `score`
 and `excerpt`. Lower BM25 scores rank first, with record ID as the tie-breaker.
 Excerpts are plain text, including any untrusted markup stored by the application;
 clients must escape them before HTML rendering. A truncated response is incomplete.
@@ -96,6 +97,78 @@ query timeout includes waiting for a connection, index validation and ranking.
 Startup validation of all configured indexes also shares that timeout.
 The application's result-byte limit and the shared SQLite heap limit also apply.
 An output limit does not bound the work required to validate or rank an index.
+
+## Optional scope and stable pagination
+
+An index may additionally declare both `scope` and `generation`:
+
+```json
+"scope": {"collection": "publications", "field": "manifest"},
+"generation": {
+  "collection": "search_state",
+  "record": "pagesindexstate",
+  "field": "generation"
+}
+```
+
+These collections must be non-system base collections. Their `id` and configured
+fields must be nonhidden and SQL-readable. The scope field contains a JSON object
+whose values are source record IDs; object keys are unique opaque identifiers.
+Scope controls result membership, not access: every authenticated account can
+select every configured scope. Applications must protect derived state writes
+through their own ordinary REST rules and hooks.
+
+For a scoped index, `scope` is required and selects the scope record by its ID:
+
+```json
+{"index":"documents","query":"deployment safety","scope":"publication0001","limit":20,"offset":0}
+```
+
+The response additionally includes `scope` and an opaque `generation`. The
+server derives this SHA-256 fingerprint from the application token, immutable
+index configuration, ranking contract version, SQLite version/source identity,
+selected scope ID and validated membership. A membership change also invalidates
+old pages even if the application forgot to rotate its raw token.
+A configuration change (including weights) therefore invalidates old result pages
+even when the stored application token is unchanged. An identical restart retains
+the fingerprint. Clients must replay the returned token, never the raw application
+record value. This fingerprint is a consistency check, not an authorization token. To fetch later pages,
+keep the index, query, scope and limit unchanged, advance `offset` by the hits
+already received, and send that generation as `expectedGeneration`. Offsets range
+from 0 to 10,000; any positive offset requires `expectedGeneration`. A supplied
+generation is checked even at offset zero. A mismatch returns HTTP 409 without
+hits; restart from zero instead of appending results from another generation.
+Unscoped indexes reject nonempty scope/generation and nonzero offset fields.
+
+Scope membership is applied **before** ordering and limiting. Results use global
+index BM25 statistics, ordered by score then source record ID. Adding history can
+change the ranking within an unchanged scope, so an immutable scope alone cannot
+stabilize pagination. There is no total count or promise of historically
+reproducible ranking. One extra hit determines `hasMore`.
+
+Each request reads scope membership, generation, validated index and results in
+one read transaction. Scope JSON must be an object of at most 10,000 entries and
+4 MiB, with unique keys and string values. Keys, values, scope IDs and generation
+tokens must be nonblank valid UTF-8 of at most 128 bytes without NUL. Every member
+must exist in the source collection. Missing index entries are allowed (for
+example, an application may intentionally omit archived source revisions).
+Missing or malformed scope/generation records fail with generic HTTP 503; they
+never fall back to unscoped search. `json_each` is a reserved schema-object name
+in databases using search, preventing objects from impersonating the built-in
+used by fixed membership queries.
+
+Applications must rotate the opaque generation token in the same transaction as
+**every** index mutation, including rebuilds, and preserve this relationship in
+backups/restores. The server checks the token; it cannot prove that application
+maintenance rotated it. Do not derive generation from connection `data_version`,
+row counts or latest publication identity. Continuous mutations may repeatedly
+invalidate pagination, which clients must surface explicitly.
+
+The search connection's scalar allocation allowance is at least 4 MiB to read
+bounded scope documents independently of the response byte cap. Scope decoding,
+member existence checks and pagination still share the query deadline; encoded
+responses retain the configured `maxBytes` limit. Large offsets and broad queries
+can require substantial ranking work despite a small response limit.
 
 ## Index consistency and ownership
 

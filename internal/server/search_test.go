@@ -237,3 +237,108 @@ func TestSearchHTTPResponseLimit(t *testing.T) {
 		t.Fatalf("search byte cap: %d %s", r.Code, r.Body)
 	}
 }
+
+func scopedSearchFixture(t *testing.T) (*tests.TestApp, Config, string) {
+	app, cfg, token, _ := searchFixture(t)
+	scopes := core.NewBaseCollection("search_scopes")
+	scopes.Fields.Add(&core.JSONField{Name: "members"}, &core.TextField{Name: "private", Hidden: true})
+	state := core.NewBaseCollection("search_state")
+	state.Fields.Add(&core.TextField{Name: "generation"})
+	for _, c := range []*core.Collection{scopes, state} {
+		if err := app.Save(c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r := core.NewRecord(scopes)
+	r.Set("id", "scope0000000001")
+	r.Set("members", map[string]string{"one": "searchrecord000", "two": "searchrecord001"})
+	if err := app.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	r = core.NewRecord(state)
+	r.Set("id", "state0000000001")
+	r.Set("generation", "one")
+	if err := app.Save(r); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Tables["search_scopes"] = []string{"id", "members"}
+	cfg.Tables["search_state"] = []string{"id", "generation"}
+	idx := cfg.Search.Indexes["deals"]
+	idx.Scope = &searchread.Scope{Collection: "search_scopes", Field: "members"}
+	idx.Generation = &searchread.Generation{Collection: "search_state", Record: "state0000000001", Field: "generation"}
+	cfg.Search.Indexes["deals"] = idx
+	return app, cfg, token
+}
+func TestSearchScopedHTTP(t *testing.T) {
+	app, cfg, token := scopedSearchFixture(t)
+	h, err := startConfiguredRouter(t, app, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := request(h, "POST", "/api/context/search", token, `{"index":"deals","query":"rocket","scope":"scope0000000001","limit":1}`)
+	var first searchread.Result
+	if err = json.Unmarshal(r.Body.Bytes(), &first); err != nil {
+		t.Fatal(err)
+	}
+	if r.Code != 200 || !first.HasMore || len(first.Generation) != 64 || first.Scope != "scope0000000001" {
+		t.Fatalf("first: %d %s", r.Code, r.Body)
+	}
+	r = request(h, "POST", "/api/context/search", token, fmt.Sprintf(`{"index":"deals","query":"rocket","scope":"scope0000000001","limit":1,"offset":1,"expectedGeneration":%q}`, first.Generation))
+	var second searchread.Result
+	json.Unmarshal(r.Body.Bytes(), &second)
+	if r.Code != 200 || second.HasMore || len(second.Hits) != 1 || second.Hits[0].ID == first.Hits[0].ID {
+		t.Fatalf("second: %d %s", r.Code, r.Body)
+	}
+	state, err := app.FindRecordById("search_state", "state0000000001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Set("generation", "two")
+	if err = app.Save(state); err != nil {
+		t.Fatal(err)
+	}
+	r = request(h, "POST", "/api/context/search", token, fmt.Sprintf(`{"index":"deals","query":"rocket","scope":"scope0000000001","limit":1,"offset":1,"expectedGeneration":%q}`, first.Generation))
+	if r.Code != 409 || strings.Contains(r.Body.String(), "searchrecord") {
+		t.Fatalf("conflict: %d %s", r.Code, r.Body)
+	}
+	for _, body := range []string{`{"index":"deals","query":"rocket"}`, `{"index":"deals","query":"rocket","scope":"scope0000000001","offset":1}`} {
+		r = request(h, "POST", "/api/context/search", token, body)
+		if r.Code != 400 {
+			t.Fatalf("missing scope/generation: %d %s", r.Code, r.Body)
+		}
+	}
+	r = request(h, "POST", "/api/context/search", token, `{"index":"deals","query":"rocket","scope":"absent"}`)
+	if r.Code != 503 {
+		t.Fatalf("missing scope: %d %s", r.Code, r.Body)
+	}
+}
+func TestSearchScopedAuthorization(t *testing.T) {
+	for _, mode := range []string{"hidden", "unexposed", "auth", "system", "missing_generation", "missing_scope", "bad_record", "bad_field"} {
+		t.Run(mode, func(t *testing.T) {
+			app, cfg, _ := scopedSearchFixture(t)
+			idx := cfg.Search.Indexes["deals"]
+			switch mode {
+			case "hidden":
+				idx.Scope.Field = "private"
+			case "unexposed":
+				delete(cfg.Tables, "search_scopes")
+			case "auth":
+				idx.Scope.Collection = "agents"
+			case "system":
+				idx.Generation.Collection = "_superusers"
+			case "missing_generation":
+				idx.Generation = nil
+			case "missing_scope":
+				idx.Scope = nil
+			case "bad_record":
+				idx.Generation.Record = ""
+			case "bad_field":
+				idx.Scope.Field = "members;DROP TABLE deals"
+			}
+			cfg.Search.Indexes["deals"] = idx
+			if _, err := startConfiguredRouter(t, app, cfg); err == nil {
+				t.Fatal("unsafe scoped configuration accepted")
+			}
+		})
+	}
+}

@@ -45,15 +45,17 @@ and a separate read-only connection pool. Preserve the existing `/query` and
 `/schema` base-collection restrictions. The search pool must never execute client
 SQL, client identifiers or client SQL fragments.
 
-A request contains only a configured index alias, query text and a bounded
-limit. The implementation quotes each whitespace-separated input term as
+An unscoped request contains a configured index alias, query text and a bounded
+limit. Scoped indexes additionally accept a scope record ID, bounded offset and
+expected generation token, as described in the [scoped search contract](search.md#optional-scope-and-stable-pagination). The implementation quotes each whitespace-separated input term as
 an FTS phrase, escapes embedded double quotes, and combines terms with `AND`.
 Do not accept raw FTS expressions initially. Reject empty input and cap input
 bytes, term count and output rows. Return stable application record IDs, a
 numeric relevance score and a bounded plain-text excerpt, ordered by score and
 record ID. Excerpts remain untrusted application text; clients must escape them
 when rendering HTML. No client-selected ranking functions, weights, tokenizer,
-column selection, SQL ordering or pagination offsets in the first version.
+column selection or SQL ordering are accepted. Pagination is available only for
+configured scopes with application-maintained generation tokens.
 
 Configuration uses a separate `search.indexes` map. Each alias declares:
 
@@ -62,6 +64,9 @@ Configuration uses a separate `search.indexes` map. Each alias declares:
 - One source base collection whose matching indexed columns and `id` must
   already be allowed under shared-workspace SQL and nonhidden.
 - A fixed snippet column and fixed ranking weights, with bounded numeric values.
+- Optionally, a nonhidden SQL-readable JSON membership field on a scope base
+  collection and a text generation field on a fixed application record. These
+  declarations must be supplied together.
 
 The implementation accepts content-storing indexes, a fixed tokenizer and a
 restricted canonical DDL shape. It rejects external-content/contentless indexes,
@@ -88,7 +93,12 @@ Each search validates canonical FTS/shadow schemas and source IDs within the
 same read transaction as retrieval. Duplicate, empty and orphan record IDs are
 rejected. This scans the corpus even for selective queries; the
 [synthetic benchmark](search-benchmark.md) measures that cost. No cache of
-validation decisions or global-index filtering is used.
+validation decisions is used. Scoped searches validate a bounded JSON object,
+check that its members exist in the source collection, and filter membership
+before ordering and limiting. Scope and generation are read in that same
+transaction. A stale expected generation returns 409 without hits. The fixed
+queries use only the built-in `json_each` value column; a schema object bearing
+that reserved name invalidates search.
 
 ## Application responsibilities
 
@@ -99,10 +109,15 @@ PocketBase API rules.
 
 Index updates, deletion and record-ID mapping must commit in the same database
 transaction as the source state change. WikiContext must update searchable
-content in the publication transaction, excluding drafts and superseded
-revisions. A search statement must see a coherent committed corpus. Rebuilds
+content in the publication transaction, excluding drafts. An all-history index
+may retain superseded published revisions; scope membership selects which
+revisions appear in results for each publication. A search statement must see a coherent committed corpus. Rebuilds
 must preserve the old complete corpus until a replacement commits, and rollback
-must restore both publication and search state. Applications must test these
+must restore both publication and search state. Every corpus mutation must rotate
+the generation token transactionally, including rebuilds that preserve scope
+identity. Global BM25 statistics can change historical rankings when new revisions
+are indexed; generation checking prevents mixed result pages rather than freezing
+old scores. Scope is not a requester-specific access policy. Applications must test these
 invariants, validate backup/restore behavior, and adopt the server pin explicitly.
 
 Only text visible to the entire search audience may enter an index. Even indexed

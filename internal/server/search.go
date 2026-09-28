@@ -43,6 +43,20 @@ func validateSearchSources(app core.App, cfg searchread.Config, schema []sqlread
 				return fmt.Errorf("search index %q source field %q must be SQL-readable and nonhidden", alias, name)
 			}
 		}
+		if index.Scope != nil && index.Generation != nil {
+			for _, pair := range [][2]string{{index.Scope.Collection, index.Scope.Field}, {index.Generation.Collection, index.Generation.Field}} {
+				c, err := app.FindCollectionByNameOrId(pair[0])
+				if err != nil || c.Name != pair[0] || !c.IsBase() || c.System {
+					return fmt.Errorf("search scope/generation requires non-system base collection")
+				}
+				for _, name := range []string{"id", pair[1]} {
+					f := c.Fields.GetByName(name)
+					if !allowed[c.Name][name] || f == nil || f.GetHidden() {
+						return fmt.Errorf("search scope/generation field must be SQL-readable and nonhidden")
+					}
+				}
+			}
+		}
 	}
 	return nil
 }
@@ -56,10 +70,12 @@ func searchDiscovery(cfg searchread.Config, maxRows int) map[string]any {
 	return map[string]any{
 		"indexes": aliases,
 		"limits": map[string]int{
-			"maxQueryBytes": searchread.MaxQueryBytes,
-			"maxTerms":      searchread.MaxTerms,
-			"maxLimit":      min(maxRows, searchread.MaxLimit),
-			"defaultLimit":  min(maxRows, searchread.DefaultLimit),
+			"maxQueryBytes":   searchread.MaxQueryBytes,
+			"maxTerms":        searchread.MaxTerms,
+			"maxOffset":       searchread.MaxOffset,
+			"maxScopeMembers": searchread.MaxScopeMembers,
+			"maxLimit":        min(maxRows, searchread.MaxLimit),
+			"defaultLimit":    min(maxRows, searchread.DefaultLimit),
 		},
 	}
 }
@@ -67,11 +83,7 @@ func searchDiscovery(cfg searchread.Config, maxRows int) map[string]any {
 func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, engine *searchread.Engine) {
 	event.Router.POST("/api/context/search", func(re *core.RequestEvent) error {
 		re.Response.Header().Set("Cache-Control", "no-store")
-		var body struct {
-			Index string `json:"index"`
-			Query string `json:"query"`
-			Limit int    `json:"limit"`
-		}
+		var body searchread.Request
 		re.Request.Body = http.MaxBytesReader(re.Response, re.Request.Body, 65536)
 		decoder := json.NewDecoder(re.Request.Body)
 		decoder.DisallowUnknownFields()
@@ -82,7 +94,7 @@ func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, engin
 			return re.BadRequestError("Expected one JSON object", nil)
 		}
 		started := time.Now()
-		result, err := engine.Search(re.Request.Context(), body.Index, body.Query, body.Limit)
+		result, err := engine.SearchRequest(re.Request.Context(), body)
 		if trace := tracing.From(re.Request.Context()); trace != nil {
 			trace.Rows, trace.Truncated = len(result.Hits), result.Truncated
 		}
@@ -99,6 +111,8 @@ func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, engin
 			case errors.Is(err, searchread.ErrBusy):
 				re.Response.Header().Set("Retry-After", "1")
 				return re.JSON(http.StatusServiceUnavailable, map[string]string{"message": "Database busy; retry the search"})
+			case errors.Is(err, searchread.ErrGenerationConflict):
+				return re.JSON(http.StatusConflict, map[string]string{"message": "Search generation changed; restart results"})
 			case errors.Is(err, searchread.ErrIndexInvalid):
 				return re.JSON(http.StatusServiceUnavailable, map[string]string{"message": "Search index unavailable"})
 			case errors.Is(err, searchread.ErrResponseLimit):
