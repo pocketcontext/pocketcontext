@@ -6,7 +6,7 @@ The server embeds PocketBase v0.40.4. By default, a separate read-only SQLite co
 
 ## Build
 
-You need Go 1.27 or later and a C compiler. The SQL reader uses `github.com/mattn/go-sqlite3` for its SQLite authorizer. PocketBase's write connections use the same SQLite library to share its process-local locking state. Agent reads use separate connections opened read-only. Build and test with the `sqlite_math_functions` and `sqlite_percentile` tags, as the Makefile does; without them SQLite lacks the supported math and percentile functions, so plain `go test ./...` fails.
+You need Go 1.27 or later and a C compiler. The SQL reader uses `github.com/mattn/go-sqlite3` for its SQLite authorizer. PocketBase's write connections use the same SQLite library to share its process-local locking state. Agent reads use separate connections opened read-only. Build and test with the `sqlite_math_functions`, `sqlite_percentile` and `sqlite_fts5` tags, as the Makefile does; without them SQLite lacks supported functionality, so plain `go test ./...` fails.
 
 ```sh
 make test
@@ -85,7 +85,11 @@ Supported distribution functions are `median(value)`, `percentile(value, p)` wit
 
 JSON expansion and aggregates can process substantially more rows than they return. Percentile aggregates use memory proportional to their input and sort those values. Output limits do not bound aggregate input; query deadlines and the shared SQLite heap cap still apply. Prefer bounded input ranges for large datasets.
 
-FTS5 remains disabled in the production build. See the [FTS5 design and prototype findings](docs/fts5-design.md) for the proposed separate search surface and remaining implementation work.
+### Optional full-text search
+
+Shared-workspace applications can configure [full-text search](docs/search.md) through `POST /api/context/search`. It returns record IDs, relevance scores and plain-text excerpts using application-maintained FTS5 indexes. The route accepts an index alias and text, never SQL. It has a separate restricted read-only connection pool; the SQL endpoint still denies FTS tables and their internal storage tables. Search cannot be combined with filtered snapshots.
+
+Search is disabled unless configured. Applications own index creation, transactional updates and publication rules, and must adopt and test the server pin and all build tags. See the [authorization design](docs/fts5-design.md) and [synthetic benchmark](docs/search-benchmark.md).
 
 ## Write through PocketBase
 

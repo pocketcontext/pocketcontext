@@ -17,6 +17,7 @@ import (
 
 	"github.com/pocketbase/pocketbase/apis"
 	"github.com/pocketbase/pocketbase/core"
+	"github.com/pocketcontext/pocketcontext/internal/searchread"
 	"github.com/pocketcontext/pocketcontext/internal/sqlread"
 	"github.com/pocketcontext/pocketcontext/internal/tracing"
 )
@@ -29,6 +30,7 @@ type Config struct {
 	MaxRows        int                     `json:"maxRows"`
 	MaxBytes       int                     `json:"maxBytes"`
 	Snapshot       *sqlread.SnapshotConfig `json:"snapshot,omitempty"`
+	Search         *searchread.Config      `json:"search,omitempty"`
 }
 
 func LoadConfig(path string) (Config, error) {
@@ -53,6 +55,9 @@ func LoadConfig(path string) (Config, error) {
 	}
 	if c.TimeoutMS < 1 || c.TimeoutMS > 30000 || c.MaxRows < 1 || c.MaxRows > 10000 || c.MaxBytes < 1024 || c.MaxBytes > 10485760 {
 		return c, fmt.Errorf("limits must be: timeoutMs 1..30000, maxRows 1..10000, maxBytes 1024..10485760")
+	}
+	if c.Search != nil && c.Snapshot != nil {
+		return c, fmt.Errorf("search is only available with shared-workspace SQL")
 	}
 	if c.Snapshot != nil {
 		if err := sqlread.NormalizeSnapshotConfig(c.Snapshot); err != nil {
@@ -146,6 +151,25 @@ func Register(app core.App, configPath string) {
 				return result, time.Time{}, err
 			}
 		}
+		var searchEngine *searchread.Engine
+		if cfg.Search != nil {
+			schema, err := schemaFn(context.Background())
+			if err == nil {
+				err = validateSearchSources(app, *cfg.Search, schema)
+			}
+			if err != nil {
+				closeFn()
+				return err
+			}
+			searchEngine, err = searchread.New(filepath.Join(app.DataDir(), "data.db"), *cfg.Search, searchread.Limits{Timeout: queryCfg.Timeout, MaxRows: cfg.MaxRows, MaxBytes: cfg.MaxBytes})
+			if err != nil {
+				closeFn()
+				return err
+			}
+			queryClose := closeFn
+			closeFn = func() error { return errors.Join(searchEngine.Close(), queryClose()) }
+			registerSearchRoute(app, e, cfg, searchEngine)
+		}
 		app.OnTerminate().BindFunc(func(te *core.TerminateEvent) error { defer closeFn(); return te.Next() })
 		e.Router.GET("/api/context/schema", func(re *core.RequestEvent) error {
 			re.Response.Header().Set("Cache-Control", "no-store")
@@ -154,6 +178,9 @@ func Register(app core.App, configPath string) {
 				return re.InternalServerError("Cannot read context schema", nil)
 			}
 			response := map[string]any{"tables": schema, "permissionModel": permissionModel, "limits": map[string]int{"timeoutMs": cfg.TimeoutMS, "maxRows": cfg.MaxRows, "maxBytes": cfg.MaxBytes}}
+			if cfg.Search != nil {
+				response["search"] = searchDiscovery(*cfg.Search, cfg.MaxRows)
+			}
 			if cfg.Snapshot != nil {
 				response["snapshotLimits"] = map[string]int{"timeoutMs": cfg.Snapshot.TimeoutMS, "maxRows": cfg.Snapshot.MaxRows, "maxBytes": cfg.Snapshot.MaxBytes, "maxConcurrent": cfg.Snapshot.MaxConcurrent}
 			}

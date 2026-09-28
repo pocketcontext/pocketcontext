@@ -1,8 +1,9 @@
-# FTS5 feasibility and proposed boundary
+# FTS5 authorization boundary
 
-Status: design and synthetic driver probe only. FTS5 is not enabled in the normal
-build, configuration or SQL endpoint. This document proposes a separate search
-surface; it does not promise full-text SQL support.
+Status: the separate opt-in search surface is implemented. FTS5 is compiled into
+the normal build but remains inaccessible through arbitrary SQL. See the
+[search contract](search.md) for configuration, maintenance and request details.
+The synthetic driver probe below records why a separate surface is necessary.
 
 ## Verified findings
 
@@ -37,16 +38,16 @@ The driver exposes operation, two operation arguments and database name; it does
 not expose SQLite's trigger/view context argument. Adding that argument alone
 has not been shown to distinguish FTS-internal work.
 
-## Proposed first implementation
+## Implemented boundary
 
-Use a dedicated authenticated `POST /api/context/search` route with fixed SQL
+The authenticated `POST /api/context/search` route uses fixed SQL
 and a separate read-only connection pool. Preserve the existing `/query` and
 `/schema` base-collection restrictions. The search pool must never execute client
 SQL, client identifiers or client SQL fragments.
 
-A request would contain only a configured index alias, query text and a bounded
-limit. The first version should quote each whitespace-separated input term as
-an FTS phrase, escape embedded double quotes, and combine terms with `AND`.
+A request contains only a configured index alias, query text and a bounded
+limit. The implementation quotes each whitespace-separated input term as
+an FTS phrase, escapes embedded double quotes, and combines terms with `AND`.
 Do not accept raw FTS expressions initially. Reject empty input and cap input
 bytes, term count and output rows. Return stable application record IDs, a
 numeric relevance score and a bounded plain-text excerpt, ordered by score and
@@ -54,20 +55,20 @@ record ID. Excerpts remain untrusted application text; clients must escape them
 when rendering HTML. No client-selected ranking functions, weights, tokenizer,
 column selection, SQL ordering or pagination offsets in the first version.
 
-Proposed configuration is a separate `search.indexes` map. Each alias declares:
+Configuration uses a separate `search.indexes` map. Each alias declares:
 
-- An exact FTS table name, explicit indexed column names and one `UNINDEXED`
-  application record-ID column.
-- For every index column, its source base collection and explicit nonhidden
-  source columns. All must already be allowed under shared-workspace SQL.
+- An exact FTS table name and explicit indexed column names. The fixed
+  `record_id UNINDEXED` column maps to the source collection's `id`.
+- One source base collection whose matching indexed columns and `id` must
+  already be allowed under shared-workspace SQL and nonhidden.
 - A fixed snippet column and fixed ranking weights, with bounded numeric values.
 
-Start with content-storing indexes, a fixed tokenizer and a restricted canonical
-DDL shape. Reject external-content/contentless indexes, arbitrary modules,
-custom tokenizers, extra columns and indirect content sources. Validate actual
-DDL and shadow-table metadata against that shape; do not infer safety from a
-name prefix. Duplicate IDs, empty IDs and stale/mismatched schema must fail
-validation. Reading actual indexed text still relies on trusted application
+The implementation accepts content-storing indexes, a fixed tokenizer and a
+restricted canonical DDL shape. It rejects external-content/contentless indexes,
+arbitrary modules, custom tokenizers, extra columns and indirect content sources.
+It validates actual DDL and shadow-table metadata against that shape rather than
+inferring safety from a name prefix. Duplicate IDs, empty IDs and mismatched
+index schemas fail validation. Reading actual indexed text still relies on trusted application
 maintenance: source declarations alone cannot prove that the application copied
 the correct text into an index.
 
@@ -75,15 +76,19 @@ Authenticate using the same configured ordinary auth collection. Search is
 shared-workspace access: every authenticated account may search every configured
 index. Reject any configuration combining search with filtered snapshots.
 
-Trusted initialization validates each index before serving traffic. Every new
-pool connection must open read-only, establish query-only mode and existing
-SQLite resource limits, then initialize only validated indexes before installing
-its narrowly enumerated authorizer. The search authorizer may permit exact
-shadow-table columns and the observed internal pragma because it receives only
-server-generated parameterized SQL. Verify prepared statements are read-only;
-do not remove the authorizer during a request. Pool growth, replacement and
-schema invalidation need explicit tests. Unexpected authorization requirements
-must fail closed rather than add broad allowances.
+Initialization validates each index before serving traffic. Every new pool
+connection opens read-only, establishes query-only mode and SQLite resource
+limits, and installs its narrowly enumerated authorizer. It permits exact
+shadow-table columns, the observed internal pragma and the metadata reads used
+by fixed validation queries. It receives only server-generated parameterized
+SQL and checks that prepared statements are read-only. The authorizer remains
+installed during requests, including cold virtual-table initialization.
+
+Each search validates canonical FTS/shadow schemas and source IDs within the
+same read transaction as retrieval. Duplicate, empty and orphan record IDs are
+rejected. This scans the corpus even for selective queries; the
+[synthetic benchmark](search-benchmark.md) measures that cost. No cache of
+validation decisions or global-index filtering is used.
 
 ## Application responsibilities
 
@@ -106,21 +111,24 @@ from a global index is therefore not a filtered-snapshot design. Requester-local
 indexes over already-filtered exports require a separate cost and isolation
 assessment and are outside the first release.
 
-## Decision and next gates
+## Application adoption gates
 
-**No-go:** add shadow-table or pragma exceptions to the arbitrary SQL reader,
-or enable FTS5 and claim search is production-ready.
+Shadow-table and pragma exceptions belong only in the fixed-query search pool.
+Compiling FTS5 alone does not authorize arbitrary SQL access or establish an
+application's search consistency.
 
-**Go:** implement and review the separate bounded route after a representative
-WikiContext benchmark justifies the index. Measure relevance, latency, index
-size, concurrent reads/writes and publication cost against batched ranked search.
-The current two-row probe measures capability and authorization behavior only.
+The separate bounded route is available for applications to adopt intentionally.
+The two-row authorizer probe establishes capabilities and security requirements;
+the synthetic corpus benchmark is not a live WikiContext performance result.
+Before application adoption, measure relevance, latency, index size, concurrent
+reads/writes and publication cost against batched ranked search on representative
+authorized data.
 
-Before release, test authentication, direct shadow/metadata denial through SQL,
-identifier collisions, malformed input, hidden source fields, invalid DDL,
-read-only initialization, cancellation and connection reuse. Exercise broad
-matches under concurrent load; output limits alone do not bound ranking work.
-Validate transaction rollback, deletion, rebuild and populated restore in the
-adopting application. Run server tests/build and affected application suites.
+Server tests cover authentication, direct shadow/metadata denial through SQL,
+malformed input, hidden source fields, invalid DDL, read-only initialization,
+cancellation and connection reuse. Application adoption additionally requires
+transaction rollback, deletion, rebuild and populated restore checks. Exercise
+broad matches under concurrent load; output limits alone do not bound ranking
+work. Run server tests/build and affected application suites.
 Enabling the compile tag must be consistent across server, application and
 container builds; arbitrary extension loading remains denied.

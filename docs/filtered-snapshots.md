@@ -76,7 +76,7 @@ The permitted ranges are 1–30000 milliseconds, 1–1000000 rows, 1024–671088
 A synthetic end-to-end benchmark is available:
 
 ```sh
-CGO_ENABLED=1 go test -tags sqlite_math_functions,sqlite_percentile ./internal/sqlread \
+CGO_ENABLED=1 go test -tags sqlite_math_functions,sqlite_percentile,sqlite_fts5 ./internal/sqlread \
   -run '^$' -bench '^BenchmarkSnapshot$' -benchtime=3x
 ```
 
