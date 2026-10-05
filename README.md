@@ -95,6 +95,10 @@ Search is disabled unless configured. Applications own index creation, transacti
 
 ## Write through PocketBase
 
+Superusers can temporarily freeze writes without restarting the process through
+the [runtime maintenance API](docs/maintenance.md). Applications must adopt its
+startup and authentication contract before using it for migration.
+
 Use `/api/collections/{collection}/records` to create records and `/api/collections/{collection}/records/{id}` to update or delete them. PocketBase applies its collection rules, validation, and hooks. The SQL endpoint cannot perform these operations.
 
 ## Permission model
