@@ -70,6 +70,7 @@ type guardedConn struct {
 	frozen             bool
 	internal           bool
 	transactionControl bool
+	vacuumControl      bool
 	preparing          *bool
 	txRelease          func()
 }
@@ -78,7 +79,7 @@ func (c *guardedConn) authorize(op int, a, b, database string) int {
 	if c.internal {
 		return sqlite3.SQLITE_OK
 	}
-	if (op == sqlite3.SQLITE_TRANSACTION || op == sqlite3.SQLITE_SAVEPOINT) && !c.transactionControl {
+	if (op == sqlite3.SQLITE_TRANSACTION || op == sqlite3.SQLITE_SAVEPOINT) && !c.transactionControl && !c.vacuumControl {
 		return sqlite3.SQLITE_DENY
 	}
 	control := op == sqlite3.SQLITE_ATTACH || op == sqlite3.SQLITE_DETACH
@@ -150,7 +151,7 @@ func (c *guardedConn) PrepareContext(ctx context.Context, query string) (driver.
 	if err != nil {
 		return nil, err
 	}
-	return &guardedStmt{raw: raw.(*sqlite3.SQLiteStmt), conn: c, control: control}, nil
+	return &guardedStmt{raw: raw.(*sqlite3.SQLiteStmt), conn: c, control: control, vacuum: vacuumStatement(query)}, nil
 }
 func (c *guardedConn) Begin() (driver.Tx, error) {
 	return c.BeginTx(context.Background(), driver.TxOptions{})
@@ -170,12 +171,23 @@ func (c *guardedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (drive
 	c.txRelease = release
 	return &guardedTx{raw: raw, conn: c}, nil
 }
+
+// Only PocketBase's standalone VACUUM forms may open an implicit SQLite
+// transaction without database/sql.Begin. Never extend this to arbitrary SQL:
+// an explicit BEGIN would escape transaction lifetime/drain tracking.
+func vacuumStatement(query string) bool {
+	q := strings.ToUpper(strings.Join(strings.Fields(strings.TrimSuffix(strings.TrimSpace(query), ";")), " "))
+	return q == "VACUUM" || q == "VACUUM INTO ?"
+}
+
 func (c *guardedConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
 	release, err := c.enter()
 	if err != nil {
 		return nil, err
 	}
 	defer release()
+	c.vacuumControl = !c.frozen && vacuumStatement(query)
+	defer func() { c.vacuumControl = false }()
 	return c.raw.ExecContext(ctx, query, args)
 }
 func (c *guardedConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
@@ -218,6 +230,7 @@ type guardedStmt struct {
 	raw     *sqlite3.SQLiteStmt
 	conn    *guardedConn
 	control bool
+	vacuum  bool
 }
 
 func (s *guardedStmt) Close() error  { return s.raw.Close() }
@@ -244,6 +257,8 @@ func (s *guardedStmt) ExecContext(ctx context.Context, args []driver.NamedValue)
 	if s.control && s.conn.frozen {
 		return nil, ErrReadOnly
 	}
+	s.conn.vacuumControl = !s.conn.frozen && s.vacuum
+	defer func() { s.conn.vacuumControl = false }()
 	return s.raw.ExecContext(ctx, args)
 }
 func (s *guardedStmt) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {

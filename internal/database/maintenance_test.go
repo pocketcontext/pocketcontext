@@ -340,3 +340,65 @@ func TestFrozenExistingPoolCannotRecreateMissingDatabase(t *testing.T) {
 		t.Fatalf("missing database unexpectedly created: %v", err)
 	}
 }
+
+func TestWritableVacuumBackupAndFrozenRefusal(t *testing.T) {
+	c, db, dir := fixture(t)
+	if _, err := db.Exec("VACUUM INTO ?", filepath.Join(dir, "first.db")); err != nil {
+		t.Fatalf("writable backup: %v", err)
+	}
+	stmt, err := db.Prepare("VACUUM INTO ?")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Close()
+	if _, err = stmt.Exec(filepath.Join(dir, "prepared.db")); err != nil {
+		t.Fatalf("prepared backup: %v", err)
+	}
+	if _, err = db.Exec("  vacuum\n into ? ;  ", filepath.Join(dir, "normalized.db")); err != nil {
+		t.Fatalf("normalized backup: %v", err)
+	}
+	freeze(t, c)
+	if _, err = db.Exec("VACUUM INTO ?", filepath.Join(dir, "forbidden.db")); err == nil {
+		t.Fatal("frozen backup allowed")
+	}
+	if _, err = stmt.Exec(filepath.Join(dir, "forbidden-prepared.db")); err == nil {
+		t.Fatal("frozen cached backup allowed")
+	}
+	if _, err = os.Stat(filepath.Join(dir, "forbidden.db")); !os.IsNotExist(err) {
+		t.Fatal("frozen backup created output")
+	}
+	if _, err = os.Stat(filepath.Join(dir, "forbidden-prepared.db")); !os.IsNotExist(err) {
+		t.Fatal("frozen prepared backup created output")
+	}
+	if _, err = c.Unfreeze(context.Background(), c.Status().Generation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec("VACUUM"); err != nil {
+		t.Fatalf("vacuum after thaw: %v", err)
+	}
+	for _, query := range []string{"BEGIN", "SAVEPOINT bypass", "VACUUM; BEGIN", "VACUUM INTO ?; BEGIN"} {
+		args := []any{}
+		if query == "VACUUM INTO ?; BEGIN" {
+			args = append(args, filepath.Join(dir, "stacked.db"))
+		}
+		if _, err = db.Exec(query, args...); err == nil {
+			t.Fatalf("untracked transaction accepted: %s", query)
+		}
+	}
+}
+
+func TestPocketBaseBackupWithMaintenanceDriver(t *testing.T) {
+	dir := t.TempDir()
+	c, err := database.NewController(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := pocketbase.NewWithConfig(pocketbase.Config{DefaultDataDir: dir, DBConnect: c.Connect})
+	if err = app.Bootstrap(); err != nil {
+		t.Fatal(err)
+	}
+	defer app.ResetBootstrapState()
+	if err = app.CreateBackup(context.Background(), "synthetic-backup.zip"); err != nil {
+		t.Fatalf("PocketBase backup: %v", err)
+	}
+}
