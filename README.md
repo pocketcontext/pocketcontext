@@ -87,7 +87,7 @@ JSON expansion and aggregates can process substantially more rows than they retu
 
 ### Optional full-text search
 
-Shared-workspace applications can configure [full-text search](docs/search.md) through `POST /api/context/search`. It returns record IDs, relevance scores and plain-text excerpts using application-maintained FTS5 indexes. The route accepts an index alias and text, never SQL. It has a separate restricted read-only connection pool; the SQL endpoint still denies FTS tables and their internal storage tables. Search cannot be combined with filtered snapshots.
+Shared-workspace applications can configure [full-text search](docs/search.md) through `POST /api/context/search`. It returns record IDs, relevance scores and plain-text excerpts using application-maintained FTS5 indexes. The route accepts an index alias and text, never SQL. It has a separate restricted read-only connection pool; the SQL endpoint still denies FTS tables and their internal storage tables. Filtered-snapshot applications instead use [private indexes](docs/search.md#private-search-for-filtered-snapshots), built per request in memory from rows the requester's snapshot filters admit, so results and rankings never depend on other accounts' data.
 
 Indexes can declare a JSON membership scope and an application-maintained generation token. Scoped requests filter before limiting, return their generation and support bounded offset pagination; a stale generation returns 409. The application must rotate the token transactionally on every index mutation, including rebuilds. See the [search contract](docs/search.md#optional-scope-and-stable-pagination).
 

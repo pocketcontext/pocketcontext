@@ -33,6 +33,48 @@ type Config struct {
 	Search         *searchread.Config      `json:"search,omitempty"`
 }
 
+// validateSearchConfig keeps shared indexes in shared-workspace mode and
+// requires private indexes over configured output tables with snapshots.
+func validateSearchConfig(c Config) error {
+	if c.Snapshot == nil {
+		if c.Search.MaxIndexBytes != 0 || c.Search.CacheBytes != 0 {
+			return fmt.Errorf("search maxIndexBytes and cacheBytes require filtered snapshots")
+		}
+		for alias, index := range c.Search.Indexes {
+			if index.Isolation != "" || index.Members != "" || index.Where != "" {
+				return fmt.Errorf("search index %q: private search indexes require filtered snapshots", alias)
+			}
+		}
+		return nil
+	}
+	if err := searchread.NormalizePrivateConfig(c.Search); err != nil {
+		return err
+	}
+	configured := func(table string, columns ...string) bool {
+		allowed := map[string]bool{}
+		for _, column := range c.Tables[table] {
+			allowed[column] = true
+		}
+		for _, column := range append([]string{"id"}, columns...) {
+			if !allowed[column] {
+				return false
+			}
+		}
+		return true
+	}
+	for alias, index := range c.Search.Indexes {
+		if _, ok := c.Tables[index.Collection]; !ok || !configured(index.Collection, index.Columns...) {
+			return fmt.Errorf("search index %q source must be a snapshot output table with configured id and indexed columns", alias)
+		}
+		if index.Scope != nil {
+			if _, ok := c.Tables[index.Scope.Collection]; !ok || !configured(index.Scope.Collection, index.Scope.Field) {
+				return fmt.Errorf("search index %q scope must be a snapshot output table with configured id and scope field", alias)
+			}
+		}
+	}
+	return nil
+}
+
 func LoadConfig(path string) (Config, error) {
 	c := Config{TimeoutMS: 2000, MaxRows: 500, MaxBytes: 1048576}
 	data, err := os.ReadFile(path)
@@ -56,9 +98,6 @@ func LoadConfig(path string) (Config, error) {
 	if c.TimeoutMS < 1 || c.TimeoutMS > 30000 || c.MaxRows < 1 || c.MaxRows > 10000 || c.MaxBytes < 1024 || c.MaxBytes > 10485760 {
 		return c, fmt.Errorf("limits must be: timeoutMs 1..30000, maxRows 1..10000, maxBytes 1024..10485760")
 	}
-	if c.Search != nil && c.Snapshot != nil {
-		return c, fmt.Errorf("search is only available with shared-workspace SQL")
-	}
 	if c.Snapshot != nil {
 		if err := sqlread.NormalizeSnapshotConfig(c.Snapshot); err != nil {
 			return c, err
@@ -75,6 +114,11 @@ func LoadConfig(path string) (Config, error) {
 			if _, exists := c.Tables[name]; exists || len(columns) == 0 {
 				return c, fmt.Errorf("snapshot policy table %q requires explicit columns and must not overlap output tables", name)
 			}
+		}
+	}
+	if c.Search != nil {
+		if err := validateSearchConfig(c); err != nil {
+			return c, err
 		}
 	}
 	if err := c.Tracing.Validate(); err != nil {
@@ -132,9 +176,10 @@ func Register(app core.App, configPath string) {
 		var schemaFn func(context.Context) ([]sqlread.Table, error)
 		var queryFn func(context.Context, string, string) (sqlread.Result, time.Time, error)
 		var closeFn func() error
+		var source *sqlread.SnapshotSource
 		permissionModel := "shared"
 		if cfg.Snapshot != nil {
-			source, err := sqlread.NewSnapshotSource(filepath.Join(app.DataDir(), "data.db"), queryCfg, *cfg.Snapshot)
+			source, err = sqlread.NewSnapshotSource(filepath.Join(app.DataDir(), "data.db"), queryCfg, *cfg.Snapshot)
 			if err != nil {
 				return err
 			}
@@ -151,7 +196,6 @@ func Register(app core.App, configPath string) {
 				return result, time.Time{}, err
 			}
 		}
-		var searchEngine *searchread.Engine
 		if cfg.Search != nil {
 			schema, err := schemaFn(context.Background())
 			if err == nil {
@@ -161,14 +205,30 @@ func Register(app core.App, configPath string) {
 				closeFn()
 				return err
 			}
-			searchEngine, err = searchread.New(filepath.Join(app.DataDir(), "data.db"), *cfg.Search, searchread.Limits{Timeout: queryCfg.Timeout, MaxRows: cfg.MaxRows, MaxBytes: cfg.MaxBytes})
-			if err != nil {
-				closeFn()
-				return err
+			limits := searchread.Limits{Timeout: queryCfg.Timeout, MaxRows: cfg.MaxRows, MaxBytes: cfg.MaxBytes}
+			var search searchFunc
+			var searchClose func() error
+			if source != nil {
+				private, err := searchread.NewPrivate(source, *cfg.Search, limits)
+				if err != nil {
+					closeFn()
+					return err
+				}
+				search, searchClose = private.SearchAs, private.Close
+			} else {
+				shared, err := searchread.New(filepath.Join(app.DataDir(), "data.db"), *cfg.Search, limits)
+				if err != nil {
+					closeFn()
+					return err
+				}
+				search = func(ctx context.Context, _ string, req searchread.Request) (searchread.Result, error) {
+					return shared.SearchRequest(ctx, req)
+				}
+				searchClose = shared.Close
 			}
 			queryClose := closeFn
-			closeFn = func() error { return errors.Join(searchEngine.Close(), queryClose()) }
-			registerSearchRoute(app, e, cfg, searchEngine)
+			closeFn = func() error { return errors.Join(searchClose(), queryClose()) }
+			registerSearchRoute(app, e, cfg, search)
 		}
 		app.OnTerminate().BindFunc(func(te *core.TerminateEvent) error { defer closeFn(); return te.Next() })
 		e.Router.GET("/api/context/schema", func(re *core.RequestEvent) error {

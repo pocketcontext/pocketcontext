@@ -68,14 +68,19 @@ func (c connector) Connect(context.Context) (driver.Conn, error) {
 	sqliteConn := conn.(*sqlite3.SQLiteConn)
 	// database/sql serializes each connection, including Conn.Raw. Keep the
 	// callback registered once: re-registering would retain driver handles.
-	trusted := new(bool)
+	trusted, jsonEach := new(bool), new(bool)
 	sqliteConn.RegisterAuthorizer(func(op int, a, b, db string) int {
 		if *trusted {
 			return sqlite3.SQLITE_OK
 		}
+		// Trusted filtered reads bind ID lists through json_each only while
+		// SnapshotSource.ReadFiltered holds this connection.
+		if *jsonEach && op == sqlite3.SQLITE_READ && strings.EqualFold(a, "json_each") && jsonTableColumn(a, b) && (db == "main" || (db == "" && b == "")) {
+			return sqlite3.SQLITE_OK
+		}
 		return c.authorize(op, a, b, db)
 	})
-	return roConn{c: sqliteConn, transactions: c.transactions, trusted: trusted}, nil
+	return roConn{c: sqliteConn, transactions: c.transactions, trusted: trusted, jsonEach: jsonEach}, nil
 }
 func (c connector) Driver() driver.Driver { return c.driver }
 
@@ -85,6 +90,7 @@ type roConn struct {
 	c            *sqlite3.SQLiteConn
 	transactions bool
 	trusted      *bool
+	jsonEach     *bool
 }
 
 func (r roConn) Close() error                   { return r.c.Close() }

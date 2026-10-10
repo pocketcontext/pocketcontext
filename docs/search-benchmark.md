@@ -94,7 +94,8 @@ Any future validation optimization must retain rejection of malformed or orphan
 IDs and coherent publication snapshots. Source permissions are validated at
 startup, as with shared SQL; restart after source schema or permission changes.
 FTS and shadow-table DDL are checked against their canonical definitions during
-each search. Filtered snapshots remain unsupported.
+each search. These measurements cover shared indexes only; private search for
+filtered snapshots builds per-request indexes and needs its own measurements.
 
 Independent synthetic tests in
 [security_review_test.go](../internal/searchread/security_review_test.go) cover
@@ -117,4 +118,28 @@ go test -tags 'sqlite_math_functions sqlite_percentile sqlite_fts5' \
 go test -tags 'sqlite_math_functions sqlite_percentile sqlite_fts5' \
   ./internal/searchread \
   -run '^TestSearch(ConcurrentPublicationSnapshot|OperatorsRemainLiteral|PopulatedBackupRestore|RejectsMalformedIDs)$'
+```
+
+## Private search concurrency check
+
+On 2026-10-10, `TestPrivateSyntheticConcurrentLoad` completed two batches of 16
+simultaneous searches over 1,000 synthetic 1,088-byte document bodies plus the
+small authorization fixture. With the Go race detector enabled, the cold batch
+completed in 630 ms and the warm batch in 600 ms. Each batch returned the expected
+10 hits and pagination flag for every request. The retained cache contained one
+index charged at 1,564,672 bytes. Admission allowed four active requests and two
+index builds; the remaining requests waited before reading content.
+
+These are single-run local wall times, not per-request percentiles or a capacity
+estimate. Every warm request still rereads authorized content. The cache charge
+is not peak process memory and excludes Go allocations and active evicted
+indexes. HTTP, authentication, deployment resource limits, larger/distinct
+corpora, concurrent publication and process RSS need separate measurement before
+a public hosting decision.
+
+Reproduce with:
+
+```sh
+go test -race -tags 'sqlite_math_functions sqlite_percentile sqlite_fts5' \
+  ./internal/searchread -run '^TestPrivateSyntheticConcurrentLoad$' -count=1 -v
 ```

@@ -29,6 +29,21 @@ func validateSearchSources(app core.App, cfg searchread.Config, schema []sqlread
 		allowed[table.Name] = columns
 	}
 	for alias, index := range cfg.Indexes {
+		if searchread.IsPrivate(index) {
+			for _, pair := range privateSources(index) {
+				c, err := app.FindCollectionByNameOrId(pair[0])
+				if err != nil || c.Name != pair[0] || !c.IsBase() || c.System {
+					return fmt.Errorf("search index %q requires non-system base source and scope collections", alias)
+				}
+				for _, name := range append([]string{"id"}, pair[1:]...) {
+					f := c.Fields.GetByName(name)
+					if !allowed[c.Name][name] || f == nil || f.GetHidden() {
+						return fmt.Errorf("search index %q field %q must be a configured nonhidden output column", alias, name)
+					}
+				}
+			}
+			continue
+		}
 		if _, err := app.FindCollectionByNameOrId(index.Table); err == nil {
 			return fmt.Errorf("search index %q table must not name a PocketBase collection", alias)
 		}
@@ -61,26 +76,43 @@ func validateSearchSources(app core.App, cfg searchread.Config, schema []sqlread
 	return nil
 }
 
+func privateSources(index searchread.Index) [][]string {
+	sources := [][]string{append([]string{index.Collection}, index.Columns...)}
+	if index.Scope != nil {
+		sources = append(sources, []string{index.Scope.Collection, index.Scope.Field})
+	}
+	return sources
+}
+
+type searchFunc func(ctx context.Context, requester string, req searchread.Request) (searchread.Result, error)
+
 func searchDiscovery(cfg searchread.Config, maxRows int) map[string]any {
 	aliases := make([]string, 0, len(cfg.Indexes))
 	for alias := range cfg.Indexes {
 		aliases = append(aliases, alias)
 	}
 	sort.Strings(aliases)
-	return map[string]any{
-		"indexes": aliases,
-		"limits": map[string]int{
-			"maxQueryBytes":   searchread.MaxQueryBytes,
-			"maxTerms":        searchread.MaxTerms,
-			"maxOffset":       searchread.MaxOffset,
-			"maxScopeMembers": searchread.MaxScopeMembers,
-			"maxLimit":        min(maxRows, searchread.MaxLimit),
-			"defaultLimit":    min(maxRows, searchread.DefaultLimit),
-		},
+	limits := map[string]int{
+		"maxQueryBytes":   searchread.MaxQueryBytes,
+		"maxTerms":        searchread.MaxTerms,
+		"maxOffset":       searchread.MaxOffset,
+		"maxScopeMembers": searchread.MaxScopeMembers,
+		"maxLimit":        min(maxRows, searchread.MaxLimit),
+		"defaultLimit":    min(maxRows, searchread.DefaultLimit),
 	}
+	discovery := map[string]any{"indexes": aliases, "limits": limits}
+	// Shared configurations keep their existing discovery output.
+	for _, index := range cfg.Indexes {
+		if searchread.IsPrivate(index) {
+			discovery["isolation"] = searchread.IsolationPrivate
+			limits["maxIndexBytes"] = cfg.MaxIndexBytes
+			break
+		}
+	}
+	return discovery
 }
 
-func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, engine *searchread.Engine) {
+func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, search searchFunc) {
 	event.Router.POST("/api/context/search", func(re *core.RequestEvent) error {
 		re.Response.Header().Set("Cache-Control", "no-store")
 		var body searchread.Request
@@ -94,7 +126,7 @@ func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, engin
 			return re.BadRequestError("Expected one JSON object", nil)
 		}
 		started := time.Now()
-		result, err := engine.SearchRequest(re.Request.Context(), body)
+		result, err := search(re.Request.Context(), re.Auth.Id, body)
 		if trace := tracing.From(re.Request.Context()); trace != nil {
 			trace.Rows, trace.Truncated = len(result.Hits), result.Truncated
 		}
@@ -111,6 +143,10 @@ func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, engin
 			case errors.Is(err, searchread.ErrBusy):
 				re.Response.Header().Set("Retry-After", "1")
 				return re.JSON(http.StatusServiceUnavailable, map[string]string{"message": "Database busy; retry the search"})
+			case errors.Is(err, searchread.ErrScopeNotFound):
+				return re.JSON(http.StatusNotFound, map[string]string{"message": "Search scope not found"})
+			case errors.Is(err, searchread.ErrIndexLimit):
+				return re.JSON(http.StatusRequestEntityTooLarge, map[string]string{"message": "Authorized search content exceeds configured limits"})
 			case errors.Is(err, searchread.ErrGenerationConflict):
 				return re.JSON(http.StatusConflict, map[string]string{"message": "Search generation changed; restart results"})
 			case errors.Is(err, searchread.ErrIndexInvalid):

@@ -39,10 +39,15 @@ var (
 	ErrIndexInvalid       = errors.New("search index is invalid")
 	ErrBusy               = errors.New("search database busy")
 	ErrResponseLimit      = errors.New("search response exceeds byte limit")
+	ErrScopeNotFound      = errors.New("search scope not found")
+	ErrIndexLimit         = errors.New("authorized search content exceeds configured limits")
 )
 
 type Config struct {
 	Indexes map[string]Index `json:"indexes"`
+	// MaxIndexBytes and CacheBytes apply only to private indexes.
+	MaxIndexBytes int `json:"maxIndexBytes,omitempty"`
+	CacheBytes    int `json:"cacheBytes,omitempty"`
 }
 type Scope struct {
 	Collection string `json:"collection"`
@@ -69,6 +74,12 @@ type Index struct {
 	Columns       []string    `json:"columns"`
 	SnippetColumn string      `json:"snippetColumn"`
 	Weights       []float64   `json:"weights,omitempty"`
+	// Isolation "private" selects per-requester search over a filtered
+	// snapshot source. Members and Where apply only to private indexes. All
+	// three are omitted for shared indexes, keeping their generation tokens.
+	Isolation string `json:"isolation,omitempty"`
+	Members   string `json:"members,omitempty"`
+	Where     string `json:"where,omitempty"`
 }
 type Limits struct {
 	Timeout           time.Duration
@@ -244,6 +255,14 @@ func New(path string, cfg Config, limits Limits) (*Engine, error) {
 	}
 	if limits.MaxBytes < 128 {
 		return nil, ErrResponseLimit
+	}
+	if cfg.MaxIndexBytes != 0 || cfg.CacheBytes != 0 {
+		return nil, fmt.Errorf("%w: maxIndexBytes and cacheBytes apply only to private indexes", ErrIndexInvalid)
+	}
+	for _, idx := range cfg.Indexes {
+		if idx.Isolation != "" || idx.Members != "" || idx.Where != "" {
+			return nil, fmt.Errorf("%w: private index requires a filtered snapshot source", ErrIndexInvalid)
+		}
 	}
 	e := &Engine{indexes: map[string]definition{}, limits: limits}
 	// Generate expected shadow DDL with the pinned SQLite implementation rather

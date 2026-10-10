@@ -80,9 +80,15 @@ CGO_ENABLED=1 go test -tags sqlite_math_functions,sqlite_percentile,sqlite_fts5 
   -run '^$' -bench '^BenchmarkSnapshot$' -benchtime=3x
 ```
 
+## Filtered reads and search
+
+`SnapshotSource.ReadFiltered` gives trusted server features one source read transaction for the authenticated requester. Reads are declared at startup with `PrepareFilteredRead`: an output table, configured output columns and an optional trusted predicate that follows filter rules. Each read applies the table's snapshot filter, optionally restricted to a list of record IDs bound through the built-in `json_each`. The ID-list permission exists only on the connection held for that transaction. Filtered reads share the snapshot concurrency slots, timeout and `maxRows`/`maxBytes` accounting, and fail without partial results in the same way as exports. A table or view named `json_each` makes them fail.
+
+Search with filtered snapshots uses these reads to build [private indexes](search.md#private-search-for-filtered-snapshots). Shared search indexes are rejected with `snapshot`.
+
 ## Authorization and freshness
 
-There is no snapshot cache. The next request reads current policy and application data in a new source transaction. A request already in progress can finish using the policy and data it captured. The snapshot timestamp describes the capture's start, not a guarantee of revocation at response delivery. Previously delivered results cannot be revoked.
+There is no snapshot cache; private search caches built indexes only by content fingerprint, after a fresh authorized read. The next request reads current policy and application data in a new source transaction. A request already in progress can finish using the policy and data it captured. The snapshot timestamp describes the capture's start, not a guarantee of revocation at response delivery. Previously delivered results cannot be revoked.
 
 Filters are the authorization policy for SQL. PocketBase record API rules are not evaluated during export. Protect list/view routes, files, custom endpoints, and writes to roles or relationships separately. Agents must use individual account tokens; a shared service token gives every caller that account's visibility. An incorrect filter can authorize too much data, so application tests should cover both permitted and denied relationships.
 

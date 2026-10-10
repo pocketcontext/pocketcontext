@@ -1,10 +1,13 @@
 # Optional full-text search
 
 PocketContext offers full-text search through a separate authenticated endpoint.
-It is opt-in and supports only shared-workspace applications. All accounts in the
-configured auth collection can search every configured index. PocketBase record
-API rules do not filter search results. A configuration combining `search` with
-`snapshot` is rejected.
+It is opt-in. Shared-workspace applications use application-maintained shared
+indexes: all accounts in the configured auth collection can search every
+configured index. Filtered-snapshot applications use
+[private indexes](#private-search-for-filtered-snapshots), built per request
+from rows the requester may read. PocketBase record API rules filter neither
+mode. A `snapshot` configuration accepts only private indexes; shared-workspace
+configurations accept only shared indexes.
 
 ## Configuration
 
@@ -88,6 +91,8 @@ aliases and request limits; internal FTS tables do not appear in SQL tables.
 Without a `search` configuration, the search route is absent.
 
 Invalid requests return 400, expired deadlines 408, and oversized results 413.
+Private indexes additionally return 404 for an unavailable scope and 413 when
+authorized content exceeds its limits (see below).
 A busy database returns 503 with `Retry-After`; an invalidated index returns 503
 with a generic unavailable message. Search logs contain account attribution,
 validated index alias, duration and result counts, but not query text or excerpts.
@@ -204,3 +209,142 @@ Applications must build with all tags in the server Makefile, including
 FTS tables, internal storage tables or SQLite metadata, issue PRAGMAs, or load
 extensions. The search pool only executes server-generated parameterized SQL;
 it is not exposed as an alternate SQL endpoint.
+
+## Private search for filtered snapshots
+
+Applications with a `snapshot` configuration may enable search only with
+private indexes. Results, excerpts, scores, ordering, `hasMore` and generation
+tokens then depend only on rows the requester's snapshot filters admit. There is
+no application-maintained FTS table: each request reads authorized rows and
+searches an in-memory FTS5 index built from exactly those rows.
+
+```json
+{
+  "authCollection": "users",
+  "tables": {
+    "page_revisions": ["id", "space", "title", "summary", "body"],
+    "publications": ["id", "space", "manifest"]
+  },
+  "snapshot": {
+    "filters": {
+      "page_revisions": "EXISTS (SELECT 1 FROM space_members m WHERE m.user = :requester AND m.space = page_revisions.space)",
+      "publications": "EXISTS (SELECT 1 FROM space_members m WHERE m.user = :requester AND m.space = publications.space)"
+    },
+    "policyTables": {"space_members": ["user", "space"]}
+  },
+  "search": {
+    "maxIndexBytes": 8388608,
+    "cacheBytes": 67108864,
+    "indexes": {
+      "pages": {
+        "isolation": "private",
+        "collection": "page_revisions",
+        "columns": ["title", "summary", "body"],
+        "snippetColumn": "body",
+        "weights": [8, 3, 1],
+        "scope": {"collection": "publications", "field": "manifest"},
+        "members": "all"
+      },
+      "notes": {
+        "isolation": "private",
+        "collection": "page_revisions",
+        "columns": ["title", "body"],
+        "snippetColumn": "body",
+        "where": "page_revisions.space <> 'archive'"
+      }
+    }
+  }
+}
+```
+
+Index fields:
+
+- `isolation` must be `"private"`. `table` and `generation` are rejected.
+- `collection`, `columns`, `snippetColumn` and `weights` follow the shared rules.
+  The source must be a snapshot output table; its `id` and every indexed column
+  must be configured output columns and nonhidden fields. Values must be text or
+  NULL (indexed as empty text); any other value fails the request with 503.
+- Optional `scope` names an output table and a configured nonhidden field holding
+  the same JSON object of member IDs as shared scopes. `members` is `"all"`
+  (default) or `"visible"`, and is accepted only with `scope`.
+- Optional `where` is a trusted predicate on the source table that narrows rows.
+  It follows snapshot filter rules: one expression, may bind only `:requester`,
+  and may reference only configured columns and policy tables. It never widens
+  the source filter.
+
+Search-level limits: `maxIndexBytes` (default 8 MiB, 1 KiB to 64 MiB) caps the
+UTF-8 bytes of IDs and indexed values read for one request. `cacheBytes`
+(default 64 MiB, from `maxIndexBytes` to 1 GiB) bounds the cache described
+below. Both are rejected in shared-workspace mode.
+
+### Authorization semantics
+
+Request fields and validation match scoped shared search: `scope` is required
+for scoped indexes and rejected otherwise; `offset` is 0 to 10,000 and positive
+offsets require `expectedGeneration`. Scope-less private indexes also return a
+generation and support stable pagination.
+
+Every request runs one filtered snapshot read transaction for the authenticated
+account, sharing the snapshot slots, timeout and `maxRows`/`maxBytes` limits:
+
+1. A scoped request reads the scope row through the scope table's filter. A
+   missing and an invisible scope both return HTTP 404 `Search scope not
+   found`. A visible scope with malformed membership returns 503.
+2. Member IDs are decoded and deduplicated, then read through the source filter
+   (and `where`). With `members: "all"`, any missing or invisible member fails
+   with generic 503 and no hits; results are never partial. With `"visible"`,
+   only visible members are indexed.
+3. A scope-less request reads every source row visible to the requester,
+   narrowed by `where`.
+
+Authorized reads run before any cache lookup, so policy-table changes,
+revocation and content changes apply to the next request. Exceeding
+`maxIndexBytes` or the snapshot limits returns 413 `Authorized search content
+exceeds configured limits`; the server never falls back to shared or partial
+data. Snapshot build failures, such as an invalid filter after a schema change,
+return generic 503.
+
+### Ranking isolation
+
+The generation is a SHA-256 fingerprint of the private ranking contract version,
+SQLite version/source identity, index configuration, scope ID (or a scope-less
+marker) and every included row's ID and indexed values, sorted by ID. A fresh
+in-memory FTS5 table with the canonical shape and `unicode61` tokenizer is filled
+in ID order, made `query_only` and queried with the same fixed BM25, snippet and
+`ORDER BY score, record_id` query as shared search. BM25 statistics therefore
+come only from the requester's included rows. Two accounts with identical
+included content receive identical hits, scores, excerpts and generations,
+regardless of other accounts' data. Paging is stable while the requester's
+included content is unchanged; another account's changes never invalidate it.
+The generation is a consistency fingerprint, not an authorization token.
+
+Built indexes are cached by fingerprint in an LRU bounded by `cacheBytes` and 64
+entries. An entry is charged the larger of its indexed bytes and its in-memory
+database size. Each index uses one pinned SQLite connection; queries on it are
+serialized with cancellable waits. A failed connection returns an error and is discarded, never empty
+results. Index builds are limited to two at a time and to an in-memory database
+of about four times `maxIndexBytes`. At most four private searches retain
+authorized rows or active indexes at once; additional requests wait before
+reading content, bounded by the query timeout or caller cancellation. Evicted
+indexes that are still in use remain alive until their requests finish, so
+`cacheBytes` is not a total process-memory cap.
+
+The authorization read uses the snapshot timeout; index build and ranking then
+use the configured query `timeoutMs`. Responses keep the `maxBytes` limit.
+
+### Residual risks and scaling
+
+- Timing reflects server load and cache state. A cache hit can reveal that some
+  account recently searched identical content, which the requester can already
+  read. Other accounts' corpus size does not affect authorized reads or ranking,
+  but shared CPU and snapshot slots do.
+- Snapshot filters, policy tables and `where` are trusted application
+  configuration. A filter that admits too much exposes it to search as well.
+- Every request reads all included rows, and each distinct content set costs an
+  index build. Cost grows with the visible corpus, not the result size. Large
+  visible sets approach `maxIndexBytes` and snapshot limits and then fail with
+  413; such applications need narrower scopes or `where` predicates. Benchmark
+  intended corpora and concurrency.
+- Cached indexes hold copies of authorized text in process memory until evicted.
+  SQLite's process-wide 256 MiB heap limit also applies; keep `cacheBytes` well
+  below it.

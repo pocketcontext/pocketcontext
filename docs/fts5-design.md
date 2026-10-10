@@ -79,7 +79,8 @@ the correct text into an index.
 
 Authenticate using the same configured ordinary auth collection. Search is
 shared-workspace access: every authenticated account may search every configured
-index. Reject any configuration combining search with filtered snapshots.
+index. Reject shared indexes in filtered-snapshot configurations; those use
+requester-local [private indexes](search.md#private-search-for-filtered-snapshots).
 
 Initialization validates each index before serving traffic. Every new pool
 connection opens read-only, establishes query-only mode and SQLite resource
@@ -123,8 +124,8 @@ invariants, validate backup/restore behavior, and adopt the server pin explicitl
 Only text visible to the entire search audience may enter an index. Even indexed
 columns omitted from results can affect matches and relevance. Filtering results
 from a global index is therefore not a filtered-snapshot design. Requester-local
-indexes over already-filtered exports require a separate cost and isolation
-assessment and are outside the first release.
+indexes over already-filtered rows are implemented separately as
+[private search](search.md#private-search-for-filtered-snapshots).
 
 ## Application adoption gates
 
