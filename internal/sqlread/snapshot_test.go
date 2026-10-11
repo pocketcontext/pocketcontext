@@ -42,7 +42,9 @@ func newTestSnapshot(t *testing.T, path string, c Config, sc SnapshotConfig) *Sn
 func cleanSnapshot(t *testing.T, s *SnapshotSource) {
 	t.Helper()
 	entries, err := os.ReadDir(s.root)
-	if err != nil || len(entries) != 0 {
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if err != nil || len(entries) != len(s.cache) {
 		t.Fatalf("snapshot files not cleaned: %v %v", entries, err)
 	}
 }

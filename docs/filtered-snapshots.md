@@ -1,6 +1,6 @@
 # Filtered snapshots
 
-Filtered snapshots let authenticated accounts query different subsets of application data with SQL. The application defines the rows and columns each requester may read. PocketContext copies those rows into a fresh private SQLite database, then runs the agent's SQL against that database using its existing read restrictions.
+Filtered snapshots let authenticated accounts query different subsets of application data with SQL. The application defines the rows and columns each requester may read. PocketContext copies those rows into a private SQLite database, then runs the agent's SQL against that database using its existing read restrictions. It reuses the authenticated requester's copy while the source database remains unchanged.
 
 This is an optional mode. Existing configurations without `snapshot` retain shared-workspace access.
 
@@ -44,14 +44,42 @@ For a management hierarchy, an application can maintain grants for each direct a
 ## Request lifecycle
 
 1. Authenticate through the normal PocketBase token mechanism.
-2. Check optional per-account admission, then acquire a snapshot concurrency slot and begin a read transaction on the source database.
-3. Evaluate the configured filters with the requester id and copy all approved rows into a fresh database. All exports share the source transaction.
-4. Finish the destination writes and open the destination with the restricted read-only SQL engine. The source database is never attached to this connection.
-5. Execute the agent query, close the query connections, and remove the temporary database.
+2. Check optional per-account admission, acquire a snapshot concurrency slot, and check the source database's commit version.
+3. Reuse the requester's immutable snapshot if its version still matches. Otherwise, evaluate all configured filters and copy approved rows from one source read transaction into a private database. Concurrent requests for that requester coordinate one build.
+4. Execute the agent query through the restricted read-only snapshot engine. The source database is never attached to this connection.
+5. Release the reader. Retain an unchanged snapshot for reuse; remove invalidated or evicted copies after their active readers finish.
+
+A dedicated physical read-only SQLite connection checks `PRAGMA data_version`
+before reuse and after construction. Any committed source-database change
+invalidates retained copies, including changes to unexported policy or auth
+tables. Values are never compared across different monitor connections. A failed
+monitor check fails the request without using cached data. A commit during
+construction permits that request to finish on its consistent source transaction,
+but its copy is not retained. Requests after the commit must observe the new
+state. Rollbacks do not invalidate copies.
+
+This is transparent caching, not a stale-read mode: there are no client snapshot
+IDs or refresh endpoints. Read-after-write and conflict-recovery lookups retain
+their existing semantics. Every request is authenticated independently. SQL and
+configuration restrictions remain unchanged; configuration/schema changes still
+require a restart.
+
+Filters containing date/time functions bypass reuse because their results can
+change without a database write. Detection uses SQLite's authorizer, including
+quoted function names; even constant-argument uses conservatively bypass caching.
+
+At most `snapshot.maxConcurrent` requester snapshots are retained, evicting the
+least recently used. Existing per-snapshot row, encoded-byte and physical-page
+limits remain enforced. Active readers can temporarily retain evicted files;
+the existing concurrency limit bounds those additional copies. Each retained
+engine has its own bounded read-connection pool. Graceful shutdown closes the
+engines and removes temporary storage. A process crash may leave private temp
+files, as with uncached construction; cached copies are never recovered or reused
+after restart.
 
 All application reads still enter through the authenticated context endpoints. Exporting is an internal server operation, not an additional database connection supplied to the agent. Record writes continue through PocketBase's standard REST API.
 
-The query and schema routes remain `/api/context/query` and `/api/context/schema`. Queries keep the existing JSON or CSV result format. Successful snapshot queries include `X-Context-Scope: authorized-snapshot` and `X-Context-Snapshot-At`. Schema discovery describes the configured output columns even when no rows are visible. It does not reveal the export filters or policy tables.
+The query and schema routes remain `/api/context/query` and `/api/context/schema`. Queries keep the existing JSON or CSV result format. Successful snapshot queries include `X-Context-Scope: authorized-snapshot` and `X-Context-Snapshot-At`. The latter is the copy's original source-transaction time; it remains unchanged on cache hits, whose source version is rechecked for every request. Schema discovery describes the configured output columns even when no rows are visible. It does not reveal the export filters or policy tables.
 
 An aggregate describes the visible population. `SELECT count(*) FROM documents` counts permitted documents, not every source document. SQL can still join, aggregate, and use CTEs across the exported tables. Relations to absent rows will not resolve in those joins.
 
@@ -73,7 +101,7 @@ When `maxConcurrentPerRequester` is positive (at most `maxConcurrent`), admissio
 
 An export that exceeds its limits fails without executing the agent query. It never returns a partial snapshot that could produce misleading aggregates. Export limits return HTTP 413, deadlines return 408, and a busy source returns 503. Other export failures return a generic server error without source SQL details. Successful exports remain subject to the normal query timeout, row limit, and encoded response limit; query results can still report `truncated: true`.
 
-Every query builds its full configured visible dataset, even if the submitted SQL selects one table or uses `LIMIT 1`. Measure export time and temporary storage for the application's largest permitted dataset and expected concurrency before choosing limits.
+Every cache miss builds its full configured visible dataset, even if the submitted SQL selects one table or uses `LIMIT 1`. Measure cold builds, warm reads, write-heavy workloads and temporary storage for the application's largest permitted dataset and expected concurrency. Frequent source commits can reduce the cache benefit.
 
 The permitted ranges are 1–30000 milliseconds, 1–1000000 rows, 1024–67108864 bytes, and 1–16 concurrent requests. Omitted or zero limits use the defaults. Source reads use a pool of at most four connections; additional requests wait within the export deadline. The byte budget does not represent total process memory: Go allocations, SQLite caches, and concurrent requests add overhead.
 
@@ -99,3 +127,26 @@ Filters are the authorization policy for SQL. PocketBase record API rules are no
 Temporary databases contain private data. They use private directories and files, with no source database attached, and are removed after success, failure, or cancellation and during normal shutdown. Abrupt process or machine failure can leave temporary files for operator or operating-system cleanup. Deleting a file does not promise secure erasure. Keep the temporary storage outside source control and application backups.
 
 The authorizer, read-only connections, function allowlist, and resource limits remain necessary: snapshots restrict which data is present; they do not grant arbitrary filesystem access or SQL writes. This boundary protects against untrusted SQL, not a compromised server process or an administrator with access to source data. Query audit logs retain the requester id and submitted SQL, so their access policy must account for literals users include in queries.
+
+## Snapshot reuse benchmark
+
+`BenchmarkSnapshotWikiHistory` uses synthetic 350-page knowledge with 3,500
+revisions and 7,000 passages (approximately 27 MiB of text). On the development
+ARM64 host, three fixed iterations repeated three times gave:
+
+| Workload | Before caching (`2fb371c`) | Cached |
+| --- | --- | --- |
+| Cold construction and query | 216 ms | 202–210 ms |
+| Repeated query, unchanged source | 217 ms | 4.20–4.26 ms |
+| Four concurrent warm queries, batch wall time | 267 ms | 4.54–4.60 ms |
+| Query after a source commit | 220 ms | 204–214 ms |
+
+Warm Go allocations fell from approximately 69 MB to 8 KB per query. These are
+local synthetic measurements, not network latency, browser load times or a
+production service-level promise. Cold and write-invalidated reads still copy the
+visible corpus. Query complexity and source write frequency remain significant.
+
+```sh
+CGO_ENABLED=1 go test -tags sqlite_math_functions,sqlite_percentile,sqlite_fts5 ./internal/sqlread \
+  -run '^$' -bench '^BenchmarkSnapshotWikiHistory$' -benchtime=3x -count=3
+```

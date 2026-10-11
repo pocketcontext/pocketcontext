@@ -69,7 +69,11 @@ func (c connector) Connect(context.Context) (driver.Conn, error) {
 	// database/sql serializes each connection, including Conn.Raw. Keep the
 	// callback registered once: re-registering would retain driver handles.
 	trusted, jsonEach := new(bool), new(bool)
+	volatile := new(bool)
 	sqliteConn.RegisterAuthorizer(func(op int, a, b, db string) int {
+		if op == sqlite3.SQLITE_FUNCTION && volatileSnapshotFunction(b) {
+			*volatile = true
+		}
 		if *trusted {
 			return sqlite3.SQLITE_OK
 		}
@@ -80,7 +84,7 @@ func (c connector) Connect(context.Context) (driver.Conn, error) {
 		}
 		return c.authorize(op, a, b, db)
 	})
-	return roConn{c: sqliteConn, transactions: c.transactions, trusted: trusted, jsonEach: jsonEach}, nil
+	return roConn{c: sqliteConn, transactions: c.transactions, trusted: trusted, jsonEach: jsonEach, volatile: volatile}, nil
 }
 func (c connector) Driver() driver.Driver { return c.driver }
 
@@ -89,6 +93,7 @@ func (c connector) Driver() driver.Driver { return c.driver }
 type roConn struct {
 	c            *sqlite3.SQLiteConn
 	transactions bool
+	volatile     *bool
 	trusted      *bool
 	jsonEach     *bool
 }

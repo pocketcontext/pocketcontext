@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -57,17 +56,23 @@ var ErrSnapshotRequesterLimit = errors.New("snapshot requester concurrency excee
 var ErrSnapshotBuild = errors.New("snapshot build failed")
 
 type SnapshotSource struct {
-	source      *Engine
-	cfg         Config
-	snapshot    SnapshotConfig
-	tables      []Table
-	exports     map[string]string
-	root        string
-	slots       chan struct{}
-	mu          sync.RWMutex
-	closed      bool
-	requesterMu sync.Mutex
-	requesters  map[string]int
+	source        *Engine
+	cfg           Config
+	snapshot      SnapshotConfig
+	tables        []Table
+	exports       map[string]string
+	root          string
+	slots         chan struct{}
+	mu            sync.RWMutex
+	closed        bool
+	requesterMu   sync.Mutex
+	requesters    map[string]int
+	cacheMu       sync.Mutex
+	cache         map[string]*snapshotEntry
+	building      map[string]chan struct{}
+	monitor       *sql.Conn
+	monitorEngine *Engine
+	cacheable     bool
 }
 
 func NewSnapshotSource(path string, cfg Config, sc SnapshotConfig) (*SnapshotSource, error) {
@@ -135,8 +140,11 @@ func NewSnapshotSource(path string, cfg Config, sc SnapshotConfig) (*SnapshotSou
 	if err != nil {
 		return nil, err
 	}
+	cacheable := true
 	err = conn.Raw(func(raw any) error {
 		c := raw.(roConn)
+		*c.volatile = false
+		defer func() { cacheable = !*c.volatile }()
 		for name, query := range exports {
 			stmt, e := c.PrepareContext(ctx, query)
 			if e != nil {
@@ -164,8 +172,20 @@ func NewSnapshotSource(path string, cfg Config, sc SnapshotConfig) (*SnapshotSou
 	if err != nil {
 		return nil, err
 	}
+	monitorEngine, err := newEngine(path, sourceCfg, true)
+	if err != nil {
+		os.RemoveAll(root)
+		return nil, err
+	}
+	monitorEngine.db.SetMaxOpenConns(1)
+	monitor, err := monitorEngine.db.Conn(ctx)
+	if err != nil {
+		monitorEngine.Close()
+		os.RemoveAll(root)
+		return nil, err
+	}
 	success = true
-	return &SnapshotSource{source: source, cfg: cfg, snapshot: sc, tables: tables, exports: exports, root: root, slots: make(chan struct{}, sc.MaxConcurrent), requesters: make(map[string]int)}, nil
+	return &SnapshotSource{source: source, cfg: cfg, snapshot: sc, tables: tables, exports: exports, root: root, slots: make(chan struct{}, sc.MaxConcurrent), requesters: make(map[string]int), monitor: monitor, monitorEngine: monitorEngine, cacheable: cacheable, cache: make(map[string]*snapshotEntry), building: make(map[string]chan struct{})}, nil
 }
 
 func (s *SnapshotSource) Close() error {
@@ -175,7 +195,10 @@ func (s *SnapshotSource) Close() error {
 		return nil
 	}
 	s.closed = true
-	return errors.Join(s.source.Close(), os.RemoveAll(s.root))
+	for _, entry := range s.cache {
+		entry.engine.Close()
+	}
+	return errors.Join(s.monitor.Close(), s.monitorEngine.Close(), s.source.Close(), os.RemoveAll(s.root))
 }
 func (s *SnapshotSource) Schema(ctx context.Context) ([]Table, error) {
 	s.mu.RLock()
@@ -218,15 +241,9 @@ func (s *SnapshotSource) Query(ctx context.Context, requester, query string) (Re
 	}
 	waitDone()
 	defer func() { <-s.slots }()
-	dir, err := os.MkdirTemp(s.root, "request-")
-	if err != nil {
-		return Result{}, time.Time{}, ErrSnapshotBuild
-	}
-	defer os.RemoveAll(dir)
-	path := filepath.Join(dir, "snapshot.db")
-	buildDone := tracing.Start(ctx, "snapshot.build")
-	at, err := s.build(buildCtx, path, requester)
-	buildDone()
+	acquireDone := tracing.Start(ctx, "snapshot.acquire")
+	entry, err := s.acquireSnapshot(buildCtx, requester)
+	acquireDone()
 	if err != nil {
 		if buildCtx.Err() != nil {
 			return Result{}, time.Time{}, buildCtx.Err()
@@ -241,19 +258,10 @@ func (s *SnapshotSource) Query(ctx context.Context, requester, query string) (Re
 		}
 		return Result{}, time.Time{}, ErrSnapshotBuild
 	}
+	defer s.releaseSnapshot(entry)
 	cancel()
-	if err := ctx.Err(); err != nil {
-		return Result{}, time.Time{}, err
-	}
-	initDone := tracing.Start(ctx, "snapshot.reader_init")
-	engine, err := New(path, s.cfg)
-	initDone()
-	if err != nil {
-		return Result{}, time.Time{}, ErrSnapshotBuild
-	}
-	defer engine.Close()
-	result, err := engine.Query(ctx, query)
-	return result, at, err
+	result, err := entry.engine.Query(ctx, query)
+	return result, entry.at, err
 }
 
 func (s *SnapshotSource) build(ctx context.Context, path, requester string) (time.Time, error) {
