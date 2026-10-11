@@ -428,7 +428,7 @@ func (e *PrivateEngine) authorizedRows(ctx context.Context, requester string, d 
 	})
 	switch {
 	case err == nil:
-	case errors.Is(err, ErrScopeNotFound), errors.Is(err, ErrIndexInvalid), errors.Is(err, ErrIndexLimit), errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+	case errors.Is(err, sqlread.ErrSnapshotRequesterLimit), errors.Is(err, ErrScopeNotFound), errors.Is(err, ErrIndexInvalid), errors.Is(err, ErrIndexLimit), errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return nil, err
 	case errors.Is(err, sqlread.ErrSnapshotLimit):
 		return nil, fmt.Errorf("%w: snapshot limits", ErrIndexLimit)

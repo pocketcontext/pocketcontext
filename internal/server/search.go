@@ -138,6 +138,9 @@ func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, searc
 		if err != nil {
 			app.Logger().Warn("Context search rejected", attrs...)
 			switch {
+			case errors.Is(err, sqlread.ErrSnapshotRequesterLimit):
+				re.Response.Header().Set("Retry-After", "1")
+				return re.JSON(http.StatusTooManyRequests, map[string]string{"message": "Too many concurrent snapshot reads for this account"})
 			case errors.Is(err, context.DeadlineExceeded):
 				return re.JSON(http.StatusRequestTimeout, map[string]string{"message": "Search deadline exceeded"})
 			case errors.Is(err, searchread.ErrBusy):

@@ -27,7 +27,8 @@ For example, an application has `documents` and a server-controlled `document_re
     "timeoutMs": 5000,
     "maxRows": 100000,
     "maxBytes": 16777216,
-    "maxConcurrent": 4
+    "maxConcurrent": 4,
+    "maxConcurrentPerRequester": 1
   }
 }
 ```
@@ -43,7 +44,7 @@ For a management hierarchy, an application can maintain grants for each direct a
 ## Request lifecycle
 
 1. Authenticate through the normal PocketBase token mechanism.
-2. Acquire a snapshot concurrency slot and begin a read transaction on the source database.
+2. Check optional per-account admission, then acquire a snapshot concurrency slot and begin a read transaction on the source database.
 3. Evaluate the configured filters with the requester id and copy all approved rows into a fresh database. All exports share the source transaction.
 4. Finish the destination writes and open the destination with the restricted read-only SQL engine. The source database is never attached to this connection.
 5. Execute the agent query, close the query connections, and remove the temporary database.
@@ -66,6 +67,9 @@ Snapshot limits are separate from the existing query result limits:
 | `snapshot.maxRows` | 100000 | Total exported rows across all tables |
 | `snapshot.maxBytes` | 16777216 | Sum of JSON-encoded exported row sizes; SQLite storage also has a bounded page allocation |
 | `snapshot.maxConcurrent` | 4 | Concurrent snapshot requests, including query execution and cleanup |
+| `snapshot.maxConcurrentPerRequester` | 0 (disabled) | Admitted SQL/filtered-read requests per authenticated account, including capacity waiting |
+
+When `maxConcurrentPerRequester` is positive (at most `maxConcurrent`), admission is checked atomically before waiting for a global slot. Excess same-account requests return HTTP 429 with `Retry-After: 1`; retry after waiting. Admission remains held through query execution and cleanup and is released on failures and cancellation. Tracking contains only live admitted requests, with no idle account entries. Set the account limit below global concurrency to stop one account monopolizing all slots. Multiple accounts can still exhaust global capacity. Omitted or zero values preserve the existing behavior. The limit applies to SQL snapshots and trusted filtered reads used by private search; it does not limit unrelated application endpoints or search execution after its filtered read completes.
 
 An export that exceeds its limits fails without executing the agent query. It never returns a partial snapshot that could produce misleading aggregates. Export limits return HTTP 413, deadlines return 408, and a busy source returns 503. Other export failures return a generic server error without source SQL details. Successful exports remain subject to the normal query timeout, row limit, and encoded response limit; query results can still report `truncated: true`.
 

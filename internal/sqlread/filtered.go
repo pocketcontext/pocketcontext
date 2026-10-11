@@ -186,6 +186,10 @@ func (s *SnapshotSource) ReadFiltered(ctx context.Context, requester string, fn 
 	if requester == "" {
 		return ErrSnapshotBuild
 	}
+	if err := s.admitRequester(ctx, requester); err != nil {
+		return err
+	}
+	defer s.releaseRequester(requester)
 	readCtx, cancel := context.WithTimeout(ctx, time.Duration(s.snapshot.TimeoutMS)*time.Millisecond)
 	defer cancel()
 	s.mu.RLock()

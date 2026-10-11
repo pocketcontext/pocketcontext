@@ -19,12 +19,13 @@ import (
 // SnapshotConfig is a trusted application policy, never request-supplied SQL.
 // Filters are WHERE expressions. :requester is the authenticated record ID.
 type SnapshotConfig struct {
-	Filters       map[string]string   `json:"filters"`
-	PolicyTables  map[string][]string `json:"policyTables"`
-	TimeoutMS     int                 `json:"timeoutMs"`
-	MaxRows       int                 `json:"maxRows"`
-	MaxBytes      int                 `json:"maxBytes"`
-	MaxConcurrent int                 `json:"maxConcurrent"`
+	Filters                   map[string]string   `json:"filters"`
+	PolicyTables              map[string][]string `json:"policyTables"`
+	TimeoutMS                 int                 `json:"timeoutMs"`
+	MaxRows                   int                 `json:"maxRows"`
+	MaxBytes                  int                 `json:"maxBytes"`
+	MaxConcurrent             int                 `json:"maxConcurrent"`
+	MaxConcurrentPerRequester int                 `json:"maxConcurrentPerRequester"`
 }
 
 func NormalizeSnapshotConfig(c *SnapshotConfig) error {
@@ -45,22 +46,28 @@ func NormalizeSnapshotConfig(c *SnapshotConfig) error {
 			return errors.New("snapshot limit outside permitted range")
 		}
 	}
+	if c.MaxConcurrentPerRequester < 0 || c.MaxConcurrentPerRequester > c.MaxConcurrent {
+		return errors.New("snapshot requester concurrency must be between zero and maxConcurrent")
+	}
 	return nil
 }
 
 var ErrSnapshotLimit = errors.New("snapshot exceeds build limit")
+var ErrSnapshotRequesterLimit = errors.New("snapshot requester concurrency exceeded")
 var ErrSnapshotBuild = errors.New("snapshot build failed")
 
 type SnapshotSource struct {
-	source   *Engine
-	cfg      Config
-	snapshot SnapshotConfig
-	tables   []Table
-	exports  map[string]string
-	root     string
-	slots    chan struct{}
-	mu       sync.RWMutex
-	closed   bool
+	source      *Engine
+	cfg         Config
+	snapshot    SnapshotConfig
+	tables      []Table
+	exports     map[string]string
+	root        string
+	slots       chan struct{}
+	mu          sync.RWMutex
+	closed      bool
+	requesterMu sync.Mutex
+	requesters  map[string]int
 }
 
 func NewSnapshotSource(path string, cfg Config, sc SnapshotConfig) (*SnapshotSource, error) {
@@ -158,7 +165,7 @@ func NewSnapshotSource(path string, cfg Config, sc SnapshotConfig) (*SnapshotSou
 		return nil, err
 	}
 	success = true
-	return &SnapshotSource{source: source, cfg: cfg, snapshot: sc, tables: tables, exports: exports, root: root, slots: make(chan struct{}, sc.MaxConcurrent)}, nil
+	return &SnapshotSource{source: source, cfg: cfg, snapshot: sc, tables: tables, exports: exports, root: root, slots: make(chan struct{}, sc.MaxConcurrent), requesters: make(map[string]int)}, nil
 }
 
 func (s *SnapshotSource) Close() error {
@@ -189,6 +196,10 @@ func (s *SnapshotSource) Query(ctx context.Context, requester, query string) (Re
 	if requester == "" {
 		return Result{}, time.Time{}, ErrSnapshotBuild
 	}
+	if err := s.admitRequester(ctx, requester); err != nil {
+		return Result{}, time.Time{}, err
+	}
+	defer s.releaseRequester(requester)
 	// Export timeout includes waiting for capacity; query execution has its own
 	// normal engine deadline. Keep the capacity slot until files are removed.
 	buildCtx, cancel := context.WithTimeout(ctx, time.Duration(s.snapshot.TimeoutMS)*time.Millisecond)
@@ -347,4 +358,35 @@ func (s *SnapshotSource) build(ctx context.Context, path, requester string) (tim
 		return time.Time{}, err
 	}
 	return at, ctx.Err()
+}
+
+// Count admitted requests before shared capacity waiting, so one requester
+// cannot fill both active slots and the wait queue. Entries exist only while a
+// request is live and are removed on every exit, including cancellation.
+func (s *SnapshotSource) admitRequester(ctx context.Context, requester string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if s.snapshot.MaxConcurrentPerRequester == 0 {
+		return nil
+	}
+	s.requesterMu.Lock()
+	defer s.requesterMu.Unlock()
+	if s.requesters[requester] >= s.snapshot.MaxConcurrentPerRequester {
+		return ErrSnapshotRequesterLimit
+	}
+	s.requesters[requester]++
+	return nil
+}
+func (s *SnapshotSource) releaseRequester(requester string) {
+	if s.snapshot.MaxConcurrentPerRequester == 0 {
+		return
+	}
+	s.requesterMu.Lock()
+	defer s.requesterMu.Unlock()
+	if s.requesters[requester] <= 1 {
+		delete(s.requesters, requester)
+	} else {
+		s.requesters[requester]--
+	}
 }

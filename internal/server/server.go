@@ -242,7 +242,7 @@ func Register(app core.App, configPath string) {
 				response["search"] = searchDiscovery(*cfg.Search, cfg.MaxRows)
 			}
 			if cfg.Snapshot != nil {
-				response["snapshotLimits"] = map[string]int{"timeoutMs": cfg.Snapshot.TimeoutMS, "maxRows": cfg.Snapshot.MaxRows, "maxBytes": cfg.Snapshot.MaxBytes, "maxConcurrent": cfg.Snapshot.MaxConcurrent}
+				response["snapshotLimits"] = map[string]int{"timeoutMs": cfg.Snapshot.TimeoutMS, "maxRows": cfg.Snapshot.MaxRows, "maxBytes": cfg.Snapshot.MaxBytes, "maxConcurrent": cfg.Snapshot.MaxConcurrent, "maxConcurrentPerRequester": cfg.Snapshot.MaxConcurrentPerRequester}
 			}
 			return re.JSON(http.StatusOK, response)
 		}).Bind(apis.RequireAuth(cfg.AuthCollection))
@@ -282,6 +282,10 @@ func Register(app core.App, configPath string) {
 			}
 			logSQL(app, re, body.SQL, body.Format, started, result, err)
 			if err != nil {
+				if errors.Is(err, sqlread.ErrSnapshotRequesterLimit) {
+					re.Response.Header().Set("Retry-After", "1")
+					return re.JSON(http.StatusTooManyRequests, map[string]string{"message": "Too many concurrent snapshot reads for this account"})
+				}
 				if errors.Is(err, sqlread.ErrSnapshotLimit) {
 					return re.JSON(http.StatusRequestEntityTooLarge, map[string]string{"message": "Authorized snapshot exceeds configured limits"})
 				}

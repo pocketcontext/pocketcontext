@@ -247,3 +247,44 @@ func TestSnapshotHTTPBuildFailureIsGeneric(t *testing.T) {
 		}
 	}
 }
+
+func TestSnapshotHTTPRequesterConcurrency(t *testing.T) {
+	app, cfg, tokens, _ := snapshotFixture(t)
+	cfg.Snapshot.MaxConcurrent = 2
+	cfg.Snapshot.MaxConcurrentPerRequester = 1
+	cfg.TimeoutMS = 1500
+	h, err := startConfiguredRouter(t, app, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *httpResponse, 4)
+	for range 4 {
+		go func() {
+			r := request(h, "POST", "/api/context/query", tokens["alice"], `{"sql":"WITH RECURSIVE x(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM x) SELECT sum(n) FROM x"}`)
+			done <- &httpResponse{r.Code, r.Body.String(), r.Header()}
+		}()
+	}
+	// Three prompt rejections establish that one slow request owns admission;
+	// polling with an ordinary same-account query could itself win admission.
+	for range 3 {
+		select {
+		case r := <-done:
+			if r.code != 429 || r.header.Get("Retry-After") != "1" {
+				t.Fatalf("expected requester 429 with retry hint: %+v", r)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("excess requester work was not promptly rejected")
+		}
+	}
+	r := request(h, "POST", "/api/context/query", tokens["bob"], `{"sql":"SELECT name FROM compensation"}`)
+	if r.Code != 200 || !strings.Contains(r.Body.String(), "carol") || strings.Contains(r.Body.String(), "bob") {
+		t.Fatalf("other account: %d %s", r.Code, r.Body)
+	}
+	if r := <-done; r.code != 408 {
+		t.Fatalf("slow query: %+v", r)
+	}
+	r = request(h, "POST", "/api/context/query", tokens["alice"], `{"sql":"SELECT name FROM compensation"}`)
+	if r.Code != 200 {
+		t.Fatalf("admission not released: %d %s", r.Code, r.Body)
+	}
+}
