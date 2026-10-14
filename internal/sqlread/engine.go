@@ -70,7 +70,11 @@ func (c connector) Connect(context.Context) (driver.Conn, error) {
 	// callback registered once: re-registering would retain driver handles.
 	trusted, jsonEach := new(bool), new(bool)
 	volatile := new(bool)
+	readTables := new(map[string]bool)
 	sqliteConn.RegisterAuthorizer(func(op int, a, b, db string) int {
+		if *readTables != nil && op == sqlite3.SQLITE_READ && (db == "main" || db == "") {
+			(*readTables)[strings.ToLower(a)] = true
+		}
 		if op == sqlite3.SQLITE_FUNCTION && volatileSnapshotFunction(b) {
 			*volatile = true
 		}
@@ -84,7 +88,7 @@ func (c connector) Connect(context.Context) (driver.Conn, error) {
 		}
 		return c.authorize(op, a, b, db)
 	})
-	return roConn{c: sqliteConn, transactions: c.transactions, trusted: trusted, jsonEach: jsonEach, volatile: volatile}, nil
+	return roConn{c: sqliteConn, transactions: c.transactions, trusted: trusted, jsonEach: jsonEach, volatile: volatile, readTables: readTables}, nil
 }
 func (c connector) Driver() driver.Driver { return c.driver }
 
@@ -96,6 +100,7 @@ type roConn struct {
 	volatile     *bool
 	trusted      *bool
 	jsonEach     *bool
+	readTables   *map[string]bool
 }
 
 func (r roConn) Close() error                   { return r.c.Close() }

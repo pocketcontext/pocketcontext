@@ -2,6 +2,7 @@ package sqlread
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,7 +26,8 @@ type snapshotEntry struct {
 	engine   *Engine
 	dir      string
 	at       time.Time
-	version  int64
+	state    snapshotState
+	sizes    map[string]tableSize
 	refs     int
 	retained bool
 	used     time.Time
@@ -57,6 +59,10 @@ func (s *SnapshotSource) discardSnapshot(entry *snapshotEntry) {
 func (s *SnapshotSource) releaseSnapshot(entry *snapshotEntry) {
 	s.cacheMu.Lock()
 	defer s.cacheMu.Unlock()
+	s.releaseSnapshotLocked(entry)
+}
+
+func (s *SnapshotSource) releaseSnapshotLocked(entry *snapshotEntry) {
 	entry.refs--
 	if !entry.retained && entry.refs == 0 {
 		entry.engine.Close()
@@ -65,25 +71,26 @@ func (s *SnapshotSource) releaseSnapshot(entry *snapshotEntry) {
 }
 
 func (s *SnapshotSource) acquireSnapshot(ctx context.Context, requester string) (*snapshotEntry, error) {
+	fullRefresh := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		s.cacheMu.Lock()
-		version, err := s.version(ctx)
+		state, err := s.state(ctx)
 		if err != nil {
 			s.cacheMu.Unlock()
 			return nil, err
 		}
-		// A commit invalidates all requesters, including changes to unexported
-		// policy/auth tables. Existing readers keep their own immutable files.
+		// Default mode invalidates all requesters on every commit. Tracking mode
+		// keeps old files only as refresh bases; their state must match to serve.
 		for user, entry := range s.cache {
-			if entry.version != version {
+			if !s.snapshot.TrackChanges && !entry.state.equal(state) {
 				delete(s.cache, user)
 				s.discardSnapshot(entry)
 			}
 		}
-		if entry := s.cache[requester]; entry != nil {
+		if entry := s.cache[requester]; entry != nil && entry.state.equal(state) {
 			entry.refs++
 			entry.used = time.Now()
 			s.cacheMu.Unlock()
@@ -100,27 +107,55 @@ func (s *SnapshotSource) acquireSnapshot(ctx context.Context, requester string) 
 		}
 		pending := make(chan struct{})
 		s.building[requester] = pending
+		var base *snapshotEntry
+		var changed map[string]bool
+		if s.snapshot.TrackChanges && s.cacheable && !fullRefresh {
+			base = s.cache[requester]
+			if base != nil {
+				base.refs++
+				changed = s.changedExports(base.state, state)
+			}
+		}
 		s.cacheMu.Unlock()
 
-		entry, buildErr := s.buildSnapshot(ctx, requester)
+		entry, buildErr := s.buildSnapshot(ctx, requester, base, changed)
 		s.cacheMu.Lock()
+		if base != nil {
+			s.releaseSnapshotLocked(base)
+		}
 		delete(s.building, requester)
 		close(pending)
 		if buildErr != nil {
 			s.cacheMu.Unlock()
 			return nil, buildErr
 		}
-		after, err := s.version(ctx)
+		after, err := s.state(ctx)
 		if err != nil {
 			s.discardSnapshot(entry)
 			s.cacheMu.Unlock()
 			return nil, err
 		}
 
+		// A partial refresh combines unchanged old tables with one source read
+		// transaction. Any intervening relevant commit makes that combination
+		// unproven: discard it and retry, never return mixed authorization/data.
+		if base != nil && !state.equal(after) {
+			s.discardSnapshot(entry)
+			s.cacheMu.Unlock()
+			// A busy writer must not cause an endless sequence of incremental
+			// retries. A full source transaction can safely finish even if a
+			// later commit prevents retaining its result.
+			fullRefresh = true
+			continue
+		}
 		entry.refs = 1
 		// A concurrent commit does not invalidate this request's consistent
 		// source transaction, but its snapshot must never be reused.
-		if s.cacheable && after == version {
+		if s.cacheable && after.equal(state) {
+			if old := s.cache[requester]; old != nil {
+				delete(s.cache, requester)
+				s.discardSnapshot(old)
+			}
 			for len(s.cache) >= s.snapshot.MaxConcurrent {
 				var oldest string
 				var at time.Time
@@ -133,7 +168,7 @@ func (s *SnapshotSource) acquireSnapshot(ctx context.Context, requester string) 
 				delete(s.cache, oldest)
 				s.discardSnapshot(old)
 			}
-			entry.version, entry.retained, entry.used = after, true, time.Now()
+			entry.state, entry.retained, entry.used = after, true, time.Now()
 			s.cache[requester] = entry
 		}
 		s.cacheMu.Unlock()
@@ -141,7 +176,7 @@ func (s *SnapshotSource) acquireSnapshot(ctx context.Context, requester string) 
 	}
 }
 
-func (s *SnapshotSource) buildSnapshot(ctx context.Context, requester string) (*snapshotEntry, error) {
+func (s *SnapshotSource) buildSnapshot(ctx context.Context, requester string, base *snapshotEntry, changed map[string]bool) (*snapshotEntry, error) {
 	dir, err := os.MkdirTemp(s.root, "request-")
 	if err != nil {
 		return nil, err
@@ -154,7 +189,16 @@ func (s *SnapshotSource) buildSnapshot(ctx context.Context, requester string) (*
 	}()
 	path := filepath.Join(dir, "snapshot.db")
 	done := tracing.Start(ctx, "snapshot.build")
-	at, err := s.build(ctx, path, requester)
+	if base != nil {
+		copyDone := tracing.Start(ctx, "snapshot.copy")
+		err := cloneSnapshot(ctx, filepath.Join(base.dir, "snapshot.db"), path)
+		copyDone()
+		if err != nil {
+			done()
+			return nil, err
+		}
+	}
+	at, sizes, err := s.build(ctx, path, requester, base, changed)
 	done()
 	if err != nil {
 		return nil, err
@@ -166,5 +210,38 @@ func (s *SnapshotSource) buildSnapshot(ctx context.Context, requester string) (*
 		return nil, err
 	}
 	success = true
-	return &snapshotEntry{engine: engine, dir: dir, at: at}, nil
+	return &snapshotEntry{engine: engine, dir: dir, at: at, sizes: sizes}, nil
+}
+
+// Cached files are immutable and have no WAL. Only private generated snapshots
+// are copied; the persistent application database is never copied this way.
+func cloneSnapshot(ctx context.Context, source, destination string) error {
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(destination, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	buf := make([]byte, 64*1024)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, readErr := in.Read(buf)
+		if n > 0 {
+			if _, err := out.Write(buf[:n]); err != nil {
+				return err
+			}
+		}
+		if readErr == io.EOF {
+			return out.Close()
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
 }

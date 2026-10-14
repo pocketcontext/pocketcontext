@@ -18,6 +18,8 @@ import (
 // SnapshotConfig is a trusted application policy, never request-supplied SQL.
 // Filters are WHERE expressions. :requester is the authenticated record ID.
 type SnapshotConfig struct {
+	TrackChanges              bool                `json:"trackChanges,omitempty"`
+	AuthorizationTable        string              `json:"-"`
 	Filters                   map[string]string   `json:"filters"`
 	PolicyTables              map[string][]string `json:"policyTables"`
 	TimeoutMS                 int                 `json:"timeoutMs"`
@@ -61,6 +63,7 @@ type SnapshotSource struct {
 	snapshot      SnapshotConfig
 	tables        []Table
 	exports       map[string]string
+	indexes       []snapshotIndex
 	root          string
 	slots         chan struct{}
 	mu            sync.RWMutex
@@ -73,6 +76,10 @@ type SnapshotSource struct {
 	monitor       *sql.Conn
 	monitorEngine *Engine
 	cacheable     bool
+	dependencies  map[string]map[string]bool
+	trackedTables []string
+	trackedSchema int64
+	lastState     *snapshotState
 }
 
 func NewSnapshotSource(path string, cfg Config, sc SnapshotConfig) (*SnapshotSource, error) {
@@ -141,23 +148,31 @@ func NewSnapshotSource(path string, cfg Config, sc SnapshotConfig) (*SnapshotSou
 		return nil, err
 	}
 	cacheable := true
+	dependencies := make(map[string]map[string]bool)
 	err = conn.Raw(func(raw any) error {
 		c := raw.(roConn)
 		*c.volatile = false
 		defer func() { cacheable = !*c.volatile }()
 		for name, query := range exports {
+			*c.readTables = make(map[string]bool)
 			stmt, e := c.PrepareContext(ctx, query)
 			if e != nil {
 				return fmt.Errorf("invalid snapshot filter for %q: %w", name, e)
 			}
 			inputs := stmt.NumInput()
 			stmt.Close()
+			dependencies[name] = *c.readTables
+			*c.readTables = nil
 			if inputs != 1 {
 				return fmt.Errorf("snapshot filter for %q may bind only :requester", name)
 			}
 		}
 		return nil
 	})
+	var indexes []snapshotIndex
+	if err == nil {
+		indexes, err = inspectSnapshotIndexes(ctx, conn, cfg.Tables)
+	}
 	conn.Close()
 	if err != nil {
 		return nil, err
@@ -185,7 +200,20 @@ func NewSnapshotSource(path string, cfg Config, sc SnapshotConfig) (*SnapshotSou
 		return nil, err
 	}
 	success = true
-	return &SnapshotSource{source: source, cfg: cfg, snapshot: sc, tables: tables, exports: exports, root: root, slots: make(chan struct{}, sc.MaxConcurrent), requesters: make(map[string]int), monitor: monitor, monitorEngine: monitorEngine, cacheable: cacheable, cache: make(map[string]*snapshotEntry), building: make(map[string]chan struct{})}, nil
+	s := &SnapshotSource{source: source, cfg: cfg, snapshot: sc, tables: tables, exports: exports, indexes: indexes, root: root, slots: make(chan struct{}, sc.MaxConcurrent), requesters: make(map[string]int), monitor: monitor, monitorEngine: monitorEngine, cacheable: cacheable, dependencies: dependencies, cache: make(map[string]*snapshotEntry), building: make(map[string]chan struct{})}
+	if sc.TrackChanges {
+		for name := range all {
+			s.trackedTables = append(s.trackedTables, name)
+		}
+		if sc.AuthorizationTable != "" {
+			s.trackedTables = append(s.trackedTables, sc.AuthorizationTable)
+		}
+		if err := s.initTracking(ctx); err != nil {
+			s.Close()
+			return nil, err
+		}
+	}
+	return s, nil
 }
 
 func (s *SnapshotSource) Close() error {
@@ -264,42 +292,60 @@ func (s *SnapshotSource) Query(ctx context.Context, requester, query string) (Re
 	return result, entry.at, err
 }
 
-func (s *SnapshotSource) build(ctx context.Context, path, requester string) (time.Time, error) {
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
-	if err != nil {
-		return time.Time{}, err
+type tableSize struct{ rows, bytes int }
+
+func (s *SnapshotSource) build(ctx context.Context, path, requester string, base *snapshotEntry, changed map[string]bool) (time.Time, map[string]tableSize, error) {
+	stats := make(map[string]tableSize)
+	if base == nil {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+		if err != nil {
+			return time.Time{}, nil, err
+		}
+		file.Close()
 	}
-	file.Close()
 	dst, err := sql.Open("sqlite3", path)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
 	defer dst.Close()
 	dst.SetMaxOpenConns(1)
 	// Bound physical storage separately from encoded rows, allowing page/schema overhead.
 	pages := s.snapshot.MaxBytes*2/4096 + len(s.tables)*4 + 32
 	if _, err = dst.ExecContext(ctx, fmt.Sprintf("PRAGMA page_size=4096; PRAGMA max_page_count=%d; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF", pages)); err != nil {
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
 	writer, err := dst.BeginTx(ctx, nil)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
 	defer writer.Rollback()
 	reader, err := s.source.db.BeginTx(ctx, nil)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
 	defer reader.Rollback()
 	// Force acquisition of the source read snapshot before recording its time.
 	// Every export, including policy subqueries, uses this same transaction.
 	first := s.tables[0]
 	if _, err = reader.ExecContext(ctx, "SELECT "+quote(first.Columns[0].Name)+" FROM "+quote(first.Name)+" LIMIT 1"); err != nil {
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
 	at := time.Now().UTC()
 	count, size := 0, 0
+	if base != nil {
+		for table, prior := range base.sizes {
+			if !changed[table] {
+				stats[table] = prior
+				count += prior.rows
+				size += prior.bytes
+			}
+		}
+	}
 	for _, table := range s.tables {
+		if base != nil && !changed[table.Name] {
+			continue
+		}
+		startCount, startSize := count, size
 		defs := []string{}
 		names := []string{}
 		marks := []string{}
@@ -313,17 +359,30 @@ func (s *SnapshotSource) build(ctx context.Context, path, requester string) (tim
 			names = append(names, quote(col))
 			marks = append(marks, "?")
 		}
-		if _, err = writer.ExecContext(ctx, "CREATE TABLE "+quote(table.Name)+" ("+strings.Join(defs, ",")+")"); err != nil {
-			return time.Time{}, err
+		if base == nil {
+			if _, err = writer.ExecContext(ctx, "CREATE TABLE "+quote(table.Name)+" ("+strings.Join(defs, ",")+")"); err != nil {
+				return time.Time{}, nil, err
+			}
+		} else {
+			for i, index := range s.indexes {
+				if index.table == table.Name {
+					if _, err = writer.ExecContext(ctx, "DROP INDEX "+quote(fmt.Sprintf("_snapshot_index_%d", i))); err != nil {
+						return time.Time{}, nil, err
+					}
+				}
+			}
+			if _, err = writer.ExecContext(ctx, "DELETE FROM "+quote(table.Name)); err != nil {
+				return time.Time{}, nil, err
+			}
 		}
 		insert, err := writer.PrepareContext(ctx, "INSERT INTO "+quote(table.Name)+" ("+strings.Join(names, ",")+") VALUES ("+strings.Join(marks, ",")+")")
 		if err != nil {
-			return time.Time{}, err
+			return time.Time{}, nil, err
 		}
 		rows, err := reader.QueryContext(ctx, s.exports[table.Name], sql.Named("requester", requester))
 		if err != nil {
 			insert.Close()
-			return time.Time{}, err
+			return time.Time{}, nil, err
 		}
 		err = func() error {
 			defer rows.Close()
@@ -356,16 +415,31 @@ func (s *SnapshotSource) build(ctx context.Context, path, requester string) (tim
 			return rows.Err()
 		}()
 		if err != nil {
-			return time.Time{}, err
+			return time.Time{}, nil, err
 		}
+		stats[table.Name] = tableSize{count - startCount, size - startSize}
 	}
 	if err = reader.Commit(); err != nil {
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
+	// Index only copied values, after export, within the same physical storage
+	// and build deadline limits. Source SQL and uniqueness constraints are not
+	// replayed, and the snapshot is not published until every index succeeds.
+	indexDone := tracing.Start(ctx, "snapshot.indexes")
+	for i, index := range s.indexes {
+		if base != nil && !changed[index.table] {
+			continue
+		}
+		if _, err = writer.ExecContext(ctx, index.statement(i)); err != nil {
+			indexDone()
+			return time.Time{}, nil, err
+		}
+	}
+	indexDone()
 	if err = writer.Commit(); err != nil {
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
-	return at, ctx.Err()
+	return at, stats, ctx.Err()
 }
 
 // Count admitted requests before shared capacity waiting, so one requester

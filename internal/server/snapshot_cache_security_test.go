@@ -16,7 +16,13 @@ import (
 // including policy grants, revocations and auth-token revocation. A cache must
 // preserve the same fresh-read contract as the uncached endpoint.
 func TestSnapshotCacheHTTPCommittedChangesAndAuthentication(t *testing.T) {
+	t.Run("database-version", func(t *testing.T) { testSnapshotCacheHTTPCommittedChangesAndAuthentication(t, false) })
+	t.Run("tracked-tables", func(t *testing.T) { testSnapshotCacheHTTPCommittedChangesAndAuthentication(t, true) })
+}
+
+func testSnapshotCacheHTTPCommittedChangesAndAuthentication(t *testing.T, tracking bool) {
 	app, cfg, tokens, people := snapshotFixture(t)
+	cfg.Snapshot.TrackChanges = tracking
 	h, err := startConfiguredRouter(t, app, cfg)
 	if err != nil {
 		t.Fatal(err)

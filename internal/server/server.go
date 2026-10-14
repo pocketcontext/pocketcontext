@@ -179,6 +179,14 @@ func Register(app core.App, configPath string) {
 		var source *sqlread.SnapshotSource
 		permissionModel := "shared"
 		if cfg.Snapshot != nil {
+			if cfg.Snapshot.TrackChanges {
+				trackingCfg := cfg
+				trackingCfg.AuthCollection = auth.Name
+				if err := ensureSnapshotTracking(app, trackingCfg); err != nil {
+					return err
+				}
+				cfg.Snapshot.AuthorizationTable = auth.Name
+			}
 			source, err = sqlread.NewSnapshotSource(filepath.Join(app.DataDir(), "data.db"), queryCfg, *cfg.Snapshot)
 			if err != nil {
 				return err
