@@ -2,6 +2,7 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"os"
 
@@ -22,12 +23,23 @@ func main() {
 		}
 		return controller.Connect(path)
 	}})
+	app.RootCmd.Version = versionDetails()
+	app.RootCmd.SetVersionTemplate("pocketcontext {{.Version}}\n")
+	// Register before the eager flag parse, and exit before maintenance state or
+	// application JavaScript can be loaded or changed.
+	app.RootCmd.InitDefaultVersionFlag()
 	var configPath, hooksDir, migrationsDir string
 	app.RootCmd.PersistentFlags().StringVar(&configPath, "contextConfig", "pocketcontext.json", "SQL read configuration file")
 	app.RootCmd.PersistentFlags().StringVar(&hooksDir, "hooksDir", "pb_hooks", "application JavaScript hooks directory")
 	app.RootCmd.PersistentFlags().StringVar(&migrationsDir, "migrationsDir", "pb_migrations", "application JavaScript migrations directory")
 	if err := app.RootCmd.ParseFlags(os.Args[1:]); err != nil && !errors.Is(err, pflag.ErrHelp) {
 		log.Fatal(err)
+	}
+	// Child commands register their own flags later. In a child invocation,
+	// --version may be a string value for one of those flags.
+	if requested, _ := app.RootCmd.Flags().GetBool("version"); requested && app.RootCmd.Flags().NArg() == 0 {
+		fmt.Fprintln(app.RootCmd.OutOrStdout(), "pocketcontext "+app.RootCmd.Version)
+		return
 	}
 	var err error
 	controller, err = database.NewController(app.DataDir())

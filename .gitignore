@@ -1,4 +1,6 @@
 /bin/
+/dist/
 /pb_data/
 .env
 *.log
+__pycache__/

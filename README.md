@@ -4,6 +4,55 @@ PocketContext lets coding agents query application data with SQL. All writes use
 
 The server embeds PocketBase v0.40.4. By default, a separate read-only SQLite connection executes agent queries against the same database. Optional [filtered snapshots](docs/filtered-snapshots.md) copy only rows permitted by application-defined filters into an isolated database, reused per requester until a source-database commit. No replication service is required. PocketContext has no application frontend. PocketBase's built-in administration dashboard remains available for server administration.
 
+## Install
+
+```sh
+curl -fsSL https://pocketcontext.com/pocketcontext/install.sh | sh
+```
+
+The installer supports Linux amd64 and arm64, and macOS 15 or later on Apple
+Silicon. It installs the executable at `~/.local/bin/pocketcontext`, verifies the
+archive's SHA-256 checksum, and replaces an existing executable only after a
+successful download and verification. It needs `curl`, `tar`, and either
+`sha256sum` or `shasum`. It does not require sudo or change shell profiles.
+
+If `~/.local/bin` is not on your PATH, add this to your shell configuration:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+```sh
+pocketcontext --version
+```
+
+Version output identifies PocketContext, the embedded PocketBase version, and
+the source commit. It does not initialize an application. Source builds report
+`dev` instead of a release number.
+
+Linux release binaries use static musl linking. macOS binaries are ad hoc signed;
+they are not Developer ID signed or notarized. Release validation covers the
+Terminal installer. See the [release guide](docs/releases.md) for the build and
+platform checks.
+
+You can also inspect a version-specific installer before running it, or download
+an archive and `checksums.txt` from [GitHub Releases](https://github.com/pocketcontext/pocketcontext/releases).
+For example:
+
+```sh
+curl -fL -o install.sh https://github.com/pocketcontext/pocketcontext/releases/download/v0.9.1/install.sh
+# Inspect install.sh, then:
+sh install.sh
+```
+
+Run the install command again to update to the latest release. Each published
+installer downloads assets from its own fixed version. Stop running servers
+before updating, back up their data, and follow each application's compatibility
+pin and migration instructions. Installing the server does not install an
+application or update its configuration, migrations, hooks, or database.
+Remove the executable with `rm "$HOME/.local/bin/pocketcontext"` to uninstall;
+application data remains in its configured directory.
+
 ## Build
 
 You need Go 1.27 or later and a C compiler. The SQL reader uses `github.com/mattn/go-sqlite3` for its SQLite authorizer. PocketBase's write connections use the same SQLite library to share its process-local locking state. Agent reads use separate connections opened read-only. Build and test with the `sqlite_math_functions`, `sqlite_percentile` and `sqlite_fts5` tags, as the Makefile does; without them SQLite lacks supported functionality, so plain `go test ./...` fails.
@@ -20,9 +69,13 @@ Applications own `pb_migrations`, optional `pb_hooks`, and `pocketcontext.json`.
 From the application directory:
 
 ```sh
-../pocketcontext/bin/pocketcontext migrate up --dir ./pb_data
-../pocketcontext/bin/pocketcontext serve --dir ./pb_data --http 127.0.0.1:8090
+pocketcontext migrate up --dir ./pb_data
+pocketcontext serve --dir ./pb_data --http 127.0.0.1:8090
 ```
+
+For a source build, use `../pocketcontext/bin/pocketcontext` instead. Always set
+`--dir` explicitly: PocketBase's default data location depends on how the
+executable is invoked, and an absolute executable path defaults beside the binary.
 
 Migrations and hooks default to `./pb_migrations` and `./pb_hooks`. Override them with `--migrationsDir` and `--hooksDir`. Set `--contextConfig` to use a configuration outside the working directory. `migrate` and `superuser` commands do not require SQL configuration. Keep the database on local disk and bind to localhost unless you configure network access and TLS.
 

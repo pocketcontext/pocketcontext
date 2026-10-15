@@ -13,3 +13,5 @@ jobs:
           cache: true
       - run: make test
       - run: make build
+      - run: python3 -B tests/installer.py
+      - run: python3 -B -m unittest discover -s tests -p test_release.py -v

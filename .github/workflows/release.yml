@@ -1,0 +1,146 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build and validate (X.Y.Z); manual runs never publish'
+        required: true
+        default: '0.9.1'
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
+      publish: ${{ steps.release.outputs.publish }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release source and version
+        id: release
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: python3 scripts/release.py metadata --version "$REQUESTED_VERSION"
+      - name: Check release lifecycle and artifact validation
+        run: python3 -B -m unittest discover -s tests -p test_release.py -v
+
+  native:
+    needs: metadata
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_amd64
+            runner: ubuntu-24.04
+          - platform: linux_arm64
+            runner: ubuntu-24.04-arm
+          - platform: darwin_arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.metadata.outputs.commit }}
+      RELEASE_PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test native server with the race detector
+        run: make test
+      - name: Check the documented native build
+        run: make build
+      - name: Build and inspect release binary; package licenses
+        run: python3 scripts/release.py build --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT" --platform "$RELEASE_PLATFORM" --output dist
+      - name: Exercise the native release binary through HTTP
+        run: python3 tests/release_smoke.py --binary "dist/$RELEASE_PLATFORM/pocketcontext" --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT"
+      - name: Exercise installer failures and native installation
+        run: python3 tests/installer.py --binary "dist/$RELEASE_PLATFORM/pocketcontext" --version "$RELEASE_VERSION"
+      - name: Exercise static release on Alpine 3.23
+        if: runner.os == 'Linux'
+        run: >-
+          docker run --rm --mount "type=bind,src=$PWD,dst=/src,readonly"
+          python:3.13-alpine3.23@sha256:07b20c774a247152e74f622034c1482495d299e070eec620ddff13e01264290b
+          python /src/tests/release_smoke.py --binary "/src/dist/$RELEASE_PLATFORM/pocketcontext"
+          --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT"
+      - name: Exercise static release on Debian 12
+        if: runner.os == 'Linux'
+        run: >-
+          docker run --rm --mount "type=bind,src=$PWD,dst=/src,readonly"
+          python:3.13-slim-bookworm@sha256:a1165e272e578941b84abc79e4ab38a0305cd12803a5c4247979ac7655f4d641
+          python /src/tests/release_smoke.py --binary "/src/dist/$RELEASE_PLATFORM/pocketcontext"
+          --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.platform }}
+          path: |
+            dist/*.tar.gz
+            dist/*.json
+          if-no-files-found: error
+          retention-days: 7
+
+  assemble:
+    needs: [metadata, native]
+    runs-on: ubuntu-24.04
+    env:
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.metadata.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: native-*
+          path: dist/native
+      - name: Assemble complete version-bound release
+        run: python3 scripts/release.py assemble --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT" --artifacts dist/native --output dist/release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ needs.metadata.outputs.version }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [metadata, assemble]
+    if: needs.metadata.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: pocketcontext-release-publication
+      cancel-in-progress: false
+      queue: max
+    env:
+      RELEASE_VERSION: ${{ needs.metadata.outputs.version }}
+      RELEASE_COMMIT: ${{ needs.metadata.outputs.commit }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.metadata.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-${{ needs.metadata.outputs.version }}
+          path: dist/release
+      - name: Upload, verify and publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release.py publish --version "$RELEASE_VERSION" --commit "$RELEASE_COMMIT" --assets dist/release
