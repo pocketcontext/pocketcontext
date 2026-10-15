@@ -113,6 +113,23 @@ class PublicationBoundaries(unittest.TestCase):
                 release.publish(self.args)
             api.assert_not_called()
 
+    def test_draft_retry_lookup_pages_when_tag_endpoint_has_no_published_release(self):
+        draft = dict(self.existing, draft=True, tag_name="v0.9.1")
+        older = [{"id": index + 10, "tag_name": f"v0.8.{index}"} for index in range(100)]
+        with mock.patch.object(release, "api", side_effect=[None, older, [draft], draft]) as api:
+            self.assertEqual(release.find_release("v0.9.1"), draft)
+            self.assertEqual(api.call_args_list, [
+                mock.call("releases/tags/v0.9.1", missing_ok=True),
+                mock.call("releases?per_page=100&page=1"),
+                mock.call("releases?per_page=100&page=2"),
+                mock.call("releases/1"),
+            ])
+
+    def test_absent_release_is_confirmed_against_draft_listing(self):
+        with mock.patch.object(release, "api", side_effect=[None, []]) as api:
+            self.assertIsNone(release.find_release("v0.9.1"))
+            self.assertEqual(api.call_count, 2)
+
     def test_published_retry_only_verifies_without_mutations(self):
         with mock.patch.object(release, "api", return_value=self.existing) as api, mock.patch.object(release, "verify_remote") as verify:
             release.publish(self.args)

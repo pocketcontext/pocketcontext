@@ -295,6 +295,24 @@ def verify_remote(release, tag, expected):
             require(sha256(Path(temporary) / name) == digest, f"Uploaded asset checksum mismatch: {name}")
 
 
+def find_release(tag):
+    # The tag endpoint only finds published releases. Authorized list requests
+    # also return drafts, allowing an interrupted upload to resume by release ID.
+    published = api(f"releases/tags/{tag}", missing_ok=True)
+    if published is not None:
+        return published
+    page = 1
+    while True:
+        releases = api(f"releases?per_page=100&page={page}")
+        matches = [item for item in releases if item["tag_name"] == tag]
+        require(len(matches) <= 1, "Multiple releases found for the requested tag")
+        if matches:
+            return api(f"releases/{matches[0]['id']}")
+        if len(releases) < 100:
+            return None
+        page += 1
+
+
 def publish(args):
     release_version, revision = version(args.version), commit(args.commit)
     tag = f"v{release_version}"
@@ -305,7 +323,7 @@ def publish(args):
     directory = Path(args.assets)
     expected = validate_assets(directory, release_version)
     marker = f"<!-- pocketcontext-release:{revision} -->"
-    release = api(f"releases/tags/{tag}", missing_ok=True)
+    release = find_release(tag)
     if release is not None:
         require(marker in (release.get("body") or ""), "Existing release was not created for this validated commit")
         if not release["draft"]:

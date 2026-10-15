@@ -347,8 +347,9 @@ raise SystemExit(subprocess.call([{real_tar!r}] + sys.argv[1:]))
                 self.assertEqual(fixture.destination.read_bytes(), b"previous executable\n")
                 self.assert_clean(fixture)
 
-    @unittest.skipUnless(NATIVE_BINARY, "pass --binary to install and execute a native release artifact")
     def test_real_native_install_and_version(self):
+        if NATIVE_BINARY is None:
+            self.skipTest("pass --binary to install and execute a native release artifact")
         fixture = self.fixture(os_name=platform.system(), machine=platform.machine())
         if platform.system() == "Darwin":
             fixture.environment["PC_TEST_MACOS"] = platform.mac_ver()[0]
@@ -375,5 +376,4 @@ if __name__ == "__main__":
     VERSION = options.version
     if options.binary:
         NATIVE_BINARY = options.binary.resolve(strict=True)
-        InstallerTests.test_real_native_install_and_version.__unittest_skip__ = False
     unittest.main(argv=[sys.argv[0], *remaining], verbosity=2)
