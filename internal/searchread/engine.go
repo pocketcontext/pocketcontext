@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
+	"github.com/pocketcontext/pocketcontext/internal/sqlread"
 )
 
 const (
@@ -65,6 +66,10 @@ type Request struct {
 	Scope              string `json:"scope,omitempty"`
 	Offset             int    `json:"offset,omitempty"`
 	ExpectedGeneration string `json:"expectedGeneration,omitempty"`
+	// Snapshot consistency applies only to background filtered snapshots.
+	Consistency        string `json:"consistency,omitempty"`
+	AtLeast            string `json:"atLeast,omitempty"`
+	SnapshotGeneration string `json:"snapshotGeneration,omitempty"`
 }
 type Index struct {
 	Scope         *Scope      `json:"scope,omitempty"`
@@ -80,6 +85,9 @@ type Index struct {
 	Isolation string `json:"isolation,omitempty"`
 	Members   string `json:"members,omitempty"`
 	Where     string `json:"where,omitempty"`
+	// SnapshotScopeWhere selects scoped indexes to prepare before a background
+	// snapshot is published. Other visible scopes are indexed lazily on disk.
+	SnapshotScopeWhere string `json:"snapshotScopeWhere,omitempty"`
 }
 type Limits struct {
 	Timeout           time.Duration
@@ -91,12 +99,13 @@ type Hit struct {
 	Excerpt string  `json:"excerpt"`
 }
 type Result struct {
-	Scope      string `json:"scope,omitempty"`
-	Generation string `json:"generation,omitempty"`
-	HasMore    bool   `json:"hasMore"`
-	Index      string `json:"index"`
-	Hits       []Hit  `json:"hits"`
-	Truncated  bool   `json:"truncated"`
+	Scope      string                    `json:"scope,omitempty"`
+	Generation string                    `json:"generation,omitempty"`
+	HasMore    bool                      `json:"hasMore"`
+	Index      string                    `json:"index"`
+	Hits       []Hit                     `json:"hits"`
+	Truncated  bool                      `json:"truncated"`
+	Snapshot   *sqlread.SnapshotMetadata `json:"snapshot,omitempty"`
 }
 type definition struct {
 	index            Index
@@ -260,7 +269,7 @@ func New(path string, cfg Config, limits Limits) (*Engine, error) {
 		return nil, fmt.Errorf("%w: maxIndexBytes and cacheBytes apply only to private indexes", ErrIndexInvalid)
 	}
 	for _, idx := range cfg.Indexes {
-		if idx.Isolation != "" || idx.Members != "" || idx.Where != "" {
+		if idx.Isolation != "" || idx.Members != "" || idx.Where != "" || idx.SnapshotScopeWhere != "" {
 			return nil, fmt.Errorf("%w: private index requires a filtered snapshot source", ErrIndexInvalid)
 		}
 	}
@@ -487,6 +496,9 @@ func (e *Engine) Search(ctx context.Context, index, query string, limit int) (Re
 func (e *Engine) SearchRequest(ctx context.Context, req Request) (Result, error) {
 	index, query, limit := req.Index, req.Query, req.Limit
 	result := Result{Index: index, Hits: []Hit{}}
+	if req.Consistency != "" || req.AtLeast != "" || req.SnapshotGeneration != "" {
+		return result, ErrInvalidQuery
+	}
 	d, ok := e.indexes[index]
 	if !ok {
 		return result, fmt.Errorf("%w: unknown index", ErrInvalidQuery)

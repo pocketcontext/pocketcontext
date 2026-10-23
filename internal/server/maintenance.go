@@ -99,7 +99,7 @@ func maintenanceRead(r *http.Request) bool {
 	collectionRead := (len(parts) == 4 && parts[3] == "auth-methods") ||
 		((len(parts) == 4 || len(parts) == 5) && parts[3] == "records")
 	fileRead := len(parts) == 5 && parts[0] == "api" && parts[1] == "files" && r.URL.Query().Get("thumb") == ""
-	return p == "/api/health" || p == "/api/context/schema" ||
+	return p == "/api/health" || p == "/api/context/schema" || p == "/api/context/snapshot" ||
 		p == "/api/realtime" || fileRead ||
 		(strings.HasPrefix(p, "/api/collections/") && collectionRead)
 }

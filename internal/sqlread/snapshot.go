@@ -18,15 +18,16 @@ import (
 // SnapshotConfig is a trusted application policy, never request-supplied SQL.
 // Filters are WHERE expressions. :requester is the authenticated record ID.
 type SnapshotConfig struct {
-	TrackChanges              bool                `json:"trackChanges,omitempty"`
-	AuthorizationTable        string              `json:"-"`
-	Filters                   map[string]string   `json:"filters"`
-	PolicyTables              map[string][]string `json:"policyTables"`
-	TimeoutMS                 int                 `json:"timeoutMs"`
-	MaxRows                   int                 `json:"maxRows"`
-	MaxBytes                  int                 `json:"maxBytes"`
-	MaxConcurrent             int                 `json:"maxConcurrent"`
-	MaxConcurrentPerRequester int                 `json:"maxConcurrentPerRequester"`
+	Background                *BackgroundSnapshotConfig `json:"background,omitempty"`
+	TrackChanges              bool                      `json:"trackChanges,omitempty"`
+	AuthorizationTable        string                    `json:"-"`
+	Filters                   map[string]string         `json:"filters"`
+	PolicyTables              map[string][]string       `json:"policyTables"`
+	TimeoutMS                 int                       `json:"timeoutMs"`
+	MaxRows                   int                       `json:"maxRows"`
+	MaxBytes                  int                       `json:"maxBytes"`
+	MaxConcurrent             int                       `json:"maxConcurrent"`
+	MaxConcurrentPerRequester int                       `json:"maxConcurrentPerRequester"`
 }
 
 func NormalizeSnapshotConfig(c *SnapshotConfig) error {
@@ -49,6 +50,9 @@ func NormalizeSnapshotConfig(c *SnapshotConfig) error {
 	}
 	if c.MaxConcurrentPerRequester < 0 || c.MaxConcurrentPerRequester > c.MaxConcurrent {
 		return errors.New("snapshot requester concurrency must be between zero and maxConcurrent")
+	}
+	if c.Background != nil {
+		return normalizeBackground(c.Background)
 	}
 	return nil
 }
@@ -80,6 +84,8 @@ type SnapshotSource struct {
 	trackedTables []string
 	trackedSchema int64
 	lastState     *snapshotState
+	background    *backgroundSnapshots
+	initializer   func(context.Context, *SnapshotLease) error
 }
 
 func NewSnapshotSource(path string, cfg Config, sc SnapshotConfig) (*SnapshotSource, error) {
@@ -131,6 +137,9 @@ func NewSnapshotSource(path string, cfg Config, sc SnapshotConfig) (*SnapshotSou
 	}
 	cfg.Tables = copied
 	sourceCfg := Config{Tables: all, Timeout: time.Duration(sc.TimeoutMS) * time.Millisecond, MaxRows: sc.MaxRows, MaxBytes: sc.MaxBytes}
+	if sc.Background != nil {
+		sourceCfg.MaxBytes = sc.Background.MaxValueBytes
+	}
 	source, err := newEngine(path, sourceCfg, true)
 	if err != nil {
 		return nil, err
@@ -213,16 +222,23 @@ func NewSnapshotSource(path string, cfg Config, sc SnapshotConfig) (*SnapshotSou
 			return nil, err
 		}
 	}
+	if sc.Background != nil {
+		s.background = newBackgroundSnapshots(s)
+	}
 	return s, nil
 }
 
 func (s *SnapshotSource) Close() error {
+	if s.background != nil {
+		s.background.stop()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return nil
 	}
 	s.closed = true
+	s.closeBackgroundEntries()
 	for _, entry := range s.cache {
 		entry.engine.Close()
 	}
@@ -238,6 +254,10 @@ func (s *SnapshotSource) Schema(ctx context.Context) ([]Table, error) {
 }
 
 func (s *SnapshotSource) Query(ctx context.Context, requester, query string) (Result, time.Time, error) {
+	if s.background != nil {
+		result, metadata, err := s.QueryWithOptions(ctx, requester, query, SnapshotReadOptions{})
+		return result, metadata.CapturedAt, err
+	}
 	if len(query) > 65536 {
 		return Result{}, time.Time{}, errors.New("SQL exceeds 65536 bytes")
 	}
@@ -311,6 +331,13 @@ func (s *SnapshotSource) build(ctx context.Context, path, requester string, base
 	dst.SetMaxOpenConns(1)
 	// Bound physical storage separately from encoded rows, allowing page/schema overhead.
 	pages := s.snapshot.MaxBytes*2/4096 + len(s.tables)*4 + 32
+	if s.background != nil {
+		budget, ok := ctx.Value(snapshotDiskBudgetKey{}).(int64)
+		if !ok || budget < 4096 {
+			return time.Time{}, nil, ErrSnapshotResource
+		}
+		pages = int(budget / 4096)
+	}
 	if _, err = dst.ExecContext(ctx, fmt.Sprintf("PRAGMA page_size=4096; PRAGMA max_page_count=%d; PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF", pages)); err != nil {
 		return time.Time{}, nil, err
 	}
@@ -388,7 +415,7 @@ func (s *SnapshotSource) build(ctx context.Context, path, requester string, base
 			defer rows.Close()
 			defer insert.Close()
 			for rows.Next() {
-				if count >= s.snapshot.MaxRows {
+				if s.background == nil && count >= s.snapshot.MaxRows {
 					return ErrSnapshotLimit
 				}
 				row := make([]any, len(names))
@@ -399,13 +426,15 @@ func (s *SnapshotSource) build(ctx context.Context, path, requester string, base
 				if err := rows.Scan(ptr...); err != nil {
 					return err
 				}
-				encoded, err := json.Marshal(row)
-				if err != nil {
-					return err
-				}
-				size += len(encoded)
-				if size > s.snapshot.MaxBytes {
-					return ErrSnapshotLimit
+				if s.background == nil {
+					encoded, err := json.Marshal(row)
+					if err != nil {
+						return err
+					}
+					size += len(encoded)
+					if size > s.snapshot.MaxBytes {
+						return ErrSnapshotLimit
+					}
 				}
 				count++
 				if _, err = insert.ExecContext(ctx, row...); err != nil {

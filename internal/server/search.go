@@ -86,7 +86,7 @@ func privateSources(index searchread.Index) [][]string {
 
 type searchFunc func(ctx context.Context, requester string, req searchread.Request) (searchread.Result, error)
 
-func searchDiscovery(cfg searchread.Config, maxRows int) map[string]any {
+func searchDiscovery(cfg searchread.Config, maxRows int, background bool) map[string]any {
 	aliases := make([]string, 0, len(cfg.Indexes))
 	for alias := range cfg.Indexes {
 		aliases = append(aliases, alias)
@@ -105,7 +105,11 @@ func searchDiscovery(cfg searchread.Config, maxRows int) map[string]any {
 	for _, index := range cfg.Indexes {
 		if searchread.IsPrivate(index) {
 			discovery["isolation"] = searchread.IsolationPrivate
-			limits["maxIndexBytes"] = cfg.MaxIndexBytes
+			if background {
+				discovery["storage"] = "snapshot-disk"
+			} else {
+				limits["maxIndexBytes"] = cfg.MaxIndexBytes
+			}
 			break
 		}
 	}
@@ -125,6 +129,12 @@ func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, searc
 		if err := decoder.Decode(new(any)); err != io.EOF {
 			return re.BadRequestError("Expected one JSON object", nil)
 		}
+		if body.Consistency != "" && body.Consistency != "available" && body.Consistency != "fresh" {
+			return re.BadRequestError("consistency must be available or fresh", nil)
+		}
+		if (cfg.Snapshot == nil || cfg.Snapshot.Background == nil) && (body.Consistency != "" || body.AtLeast != "" || body.SnapshotGeneration != "") {
+			return re.BadRequestError("Search snapshot options require background snapshots", nil)
+		}
 		started := time.Now()
 		result, err := search(re.Request.Context(), re.Auth.Id, body)
 		if trace := tracing.From(re.Request.Context()); trace != nil {
@@ -137,6 +147,9 @@ func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, searc
 		attrs := []any{"auth", re.Auth.Id, "collection", re.Auth.Collection().Name, "index", alias, "durationMs", time.Since(started).Milliseconds(), "rows", len(result.Hits), "truncated", result.Truncated}
 		if err != nil {
 			app.Logger().Warn("Context search rejected", attrs...)
+			if handled, responseErr := snapshotHTTPError(re, err); handled {
+				return responseErr
+			}
 			switch {
 			case errors.Is(err, sqlread.ErrSnapshotRequesterLimit):
 				re.Response.Header().Set("Retry-After", "1")
@@ -155,7 +168,7 @@ func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, searc
 			case errors.Is(err, searchread.ErrIndexInvalid):
 				return re.JSON(http.StatusServiceUnavailable, map[string]string{"message": "Search index unavailable"})
 			case errors.Is(err, searchread.ErrResponseLimit):
-				return re.JSON(http.StatusRequestEntityTooLarge, map[string]string{"message": "Search result exceeds maxBytes"})
+				return re.JSON(http.StatusRequestEntityTooLarge, map[string]string{"code": "result_limit", "message": "Search result exceeds maxBytes"})
 			case errors.Is(err, searchread.ErrInvalidQuery):
 				return re.BadRequestError("Search request rejected", nil)
 			default:
@@ -170,7 +183,10 @@ func registerSearchRoute(app core.App, event *core.ServeEvent, cfg Config, searc
 			return re.InternalServerError("Cannot encode search result", nil)
 		}
 		if len(payload) > cfg.MaxBytes {
-			return re.JSON(http.StatusRequestEntityTooLarge, map[string]string{"message": "Encoded search result exceeds maxBytes"})
+			return re.JSON(http.StatusRequestEntityTooLarge, map[string]string{"code": "result_limit", "message": "Encoded search result exceeds maxBytes"})
+		}
+		if result.Snapshot != nil {
+			setSnapshotHeaders(re, *result.Snapshot)
 		}
 		re.Response.Header().Add("Access-Control-Expose-Headers", "X-Context-Truncated")
 		re.Response.Header().Set("X-Context-Truncated", fmt.Sprint(result.Truncated))

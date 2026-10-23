@@ -41,7 +41,7 @@ func validateSearchConfig(c Config) error {
 			return fmt.Errorf("search maxIndexBytes and cacheBytes require filtered snapshots")
 		}
 		for alias, index := range c.Search.Indexes {
-			if index.Isolation != "" || index.Members != "" || index.Where != "" {
+			if index.Isolation != "" || index.Members != "" || index.Where != "" || index.SnapshotScopeWhere != "" {
 				return fmt.Errorf("search index %q: private search indexes require filtered snapshots", alias)
 			}
 		}
@@ -63,6 +63,9 @@ func validateSearchConfig(c Config) error {
 		return true
 	}
 	for alias, index := range c.Search.Indexes {
+		if index.SnapshotScopeWhere != "" && c.Snapshot.Background == nil {
+			return fmt.Errorf("search index %q snapshotScopeWhere requires background snapshots", alias)
+		}
 		if _, ok := c.Tables[index.Collection]; !ok || !configured(index.Collection, index.Columns...) {
 			return fmt.Errorf("search index %q source must be a snapshot output table with configured id and indexed columns", alias)
 		}
@@ -239,6 +242,10 @@ func Register(app core.App, configPath string) {
 			registerSearchRoute(app, e, cfg, search)
 		}
 		app.OnTerminate().BindFunc(func(te *core.TerminateEvent) error { defer closeFn(); return te.Next() })
+		backgroundSnapshots := source != nil && source.BackgroundEnabled()
+		if backgroundSnapshots {
+			registerSnapshotStatus(e, cfg.AuthCollection, source)
+		}
 		e.Router.GET("/api/context/schema", func(re *core.RequestEvent) error {
 			re.Response.Header().Set("Cache-Control", "no-store")
 			schema, err := schemaFn(re.Request.Context())
@@ -247,30 +254,51 @@ func Register(app core.App, configPath string) {
 			}
 			response := map[string]any{"tables": schema, "permissionModel": permissionModel, "limits": map[string]int{"timeoutMs": cfg.TimeoutMS, "maxRows": cfg.MaxRows, "maxBytes": cfg.MaxBytes}}
 			if cfg.Search != nil {
-				response["search"] = searchDiscovery(*cfg.Search, cfg.MaxRows)
+				response["search"] = searchDiscovery(*cfg.Search, cfg.MaxRows, backgroundSnapshots)
 			}
 			if cfg.Snapshot != nil {
 				response["snapshotLimits"] = map[string]int{"timeoutMs": cfg.Snapshot.TimeoutMS, "maxRows": cfg.Snapshot.MaxRows, "maxBytes": cfg.Snapshot.MaxBytes, "maxConcurrent": cfg.Snapshot.MaxConcurrent, "maxConcurrentPerRequester": cfg.Snapshot.MaxConcurrentPerRequester}
+				if backgroundSnapshots {
+					response["snapshot"] = map[string]any{
+						"mode": "background", "defaultConsistency": "available",
+						"consistency":      []string{"available", "fresh"},
+						"generationChecks": true, "statusPath": "/api/context/snapshot",
+						"resources":                  cfg.Snapshot.Background,
+						"legacyRowByteLimitsApplyTo": "filtered-reads",
+					}
+				}
 			}
 			return re.JSON(http.StatusOK, response)
 		}).Bind(apis.RequireAuth(cfg.AuthCollection))
 		e.Router.POST("/api/context/query", func(re *core.RequestEvent) error {
 			re.Response.Header().Set("Cache-Control", "no-store")
 			var body struct {
-				SQL    string `json:"sql"`
-				Format string `json:"format"`
+				SQL                string `json:"sql"`
+				Format             string `json:"format"`
+				Consistency        string `json:"consistency"`
+				AtLeast            string `json:"atLeast"`
+				ExpectedGeneration string `json:"expectedGeneration"`
 			}
 			re.Request.Body = http.MaxBytesReader(re.Response, re.Request.Body, 65536)
 			decoder := json.NewDecoder(re.Request.Body)
 			decoder.DisallowUnknownFields()
 			if err := decoder.Decode(&body); err != nil {
-				return re.BadRequestError("Expected JSON with sql and optional format", nil)
+				return re.BadRequestError("Expected JSON with sql and optional format or snapshot read options", nil)
 			}
 			if err := decoder.Decode(new(any)); err != io.EOF {
 				return re.BadRequestError("Expected one JSON object", nil)
 			}
 			if body.Format != "" && body.Format != "json" && body.Format != "csv" {
 				return re.BadRequestError("format must be json or csv", nil)
+			}
+			if body.Consistency != "" && body.Consistency != "available" && body.Consistency != "fresh" {
+				return re.BadRequestError("consistency must be available or fresh", nil)
+			}
+			if source == nil && (body.Consistency != "" || body.AtLeast != "" || body.ExpectedGeneration != "") {
+				return re.BadRequestError("Snapshot read options require filtered snapshots", nil)
+			}
+			if !backgroundSnapshots && (body.AtLeast != "" || body.ExpectedGeneration != "") {
+				return re.BadRequestError("Snapshot generation checks require background snapshots", nil)
 			}
 			trace := tracing.From(re.Request.Context())
 			if trace != nil && cfg.Tracing.CaptureSQL && (cfg.Tracing.Delivery != "buffer" || re.Request.Header.Get("X-Context-Capture-Sql") == "1") {
@@ -283,13 +311,27 @@ func Register(app core.App, configPath string) {
 				}
 			}
 			started := time.Now()
-			result, snapshotAt, err := queryFn(re.Request.Context(), re.Auth.Id, body.SQL)
+			var result sqlread.Result
+			var snapshotAt time.Time
+			var snapshot sqlread.SnapshotMetadata
+			var err error
+			if backgroundSnapshots {
+				result, snapshot, err = source.QueryWithOptions(re.Request.Context(), re.Auth.Id, body.SQL, sqlread.SnapshotReadOptions{
+					Consistency: body.Consistency, AtLeast: body.AtLeast, ExpectedGeneration: body.ExpectedGeneration,
+				})
+				snapshotAt = snapshot.CapturedAt
+			} else {
+				result, snapshotAt, err = queryFn(re.Request.Context(), re.Auth.Id, body.SQL)
+			}
 			if trace != nil {
 				trace.Rows = len(result.Rows)
 				trace.Truncated = result.Truncated
 			}
 			logSQL(app, re, body.SQL, body.Format, started, result, err)
 			if err != nil {
+				if handled, responseErr := snapshotHTTPError(re, err); handled {
+					return responseErr
+				}
 				if errors.Is(err, sqlread.ErrSnapshotRequesterLimit) {
 					re.Response.Header().Set("Retry-After", "1")
 					return re.JSON(http.StatusTooManyRequests, map[string]string{"message": "Too many concurrent snapshot reads for this account"})
@@ -315,6 +357,11 @@ func Register(app core.App, configPath string) {
 			if body.Format == "csv" {
 				payload, err = result.CSV()
 				contentType = "text/csv; charset=utf-8"
+			} else if backgroundSnapshots {
+				payload, err = json.Marshal(struct {
+					sqlread.Result
+					Snapshot sqlread.SnapshotMetadata `json:"snapshot"`
+				}{Result: result, Snapshot: snapshot})
 			} else {
 				payload, err = json.Marshal(result)
 			}
@@ -323,12 +370,15 @@ func Register(app core.App, configPath string) {
 				return re.InternalServerError("Cannot encode query result", nil)
 			}
 			if len(payload) > cfg.MaxBytes {
-				return re.JSON(http.StatusRequestEntityTooLarge, map[string]string{"message": "Encoded result exceeds maxBytes; select fewer or smaller fields"})
+				return re.JSON(http.StatusRequestEntityTooLarge, map[string]string{"code": "result_limit", "message": "Encoded result exceeds maxBytes; select fewer or smaller fields"})
 			}
 			if cfg.Snapshot != nil {
 				re.Response.Header().Add("Access-Control-Expose-Headers", "X-Context-Scope, X-Context-Snapshot-At, X-Context-Truncated")
 				re.Response.Header().Set("X-Context-Scope", "authorized-snapshot")
 				re.Response.Header().Set("X-Context-Snapshot-At", snapshotAt.UTC().Format(time.RFC3339Nano))
+				if backgroundSnapshots {
+					setSnapshotHeaders(re, snapshot)
+				}
 			}
 			re.Response.Header().Set("X-Context-Truncated", fmt.Sprint(result.Truncated))
 			return re.Blob(http.StatusOK, contentType, payload)

@@ -256,7 +256,7 @@ func TestPrivateSearchHTTPLimits(t *testing.T) {
 }
 
 func TestPrivateSearchHTTPRejectsConfiguration(t *testing.T) {
-	for _, name := range []string{"private in shared mode", "shared in snapshot mode", "table", "generation", "policy source", "unlisted source", "unconfigured column", "hidden column", "unconfigured scope field", "hidden scope field", "policy scope", "bad where", "where binds", "where unlisted column", "members without scope", "limits in shared mode", "bad limits"} {
+	for _, name := range []string{"private in shared mode", "shared in snapshot mode", "table", "generation", "policy source", "unlisted source", "unconfigured column", "hidden column", "unconfigured scope field", "hidden scope field", "policy scope", "bad where", "where binds", "where unlisted column", "members without scope", "limits in shared mode", "warm scopes without background", "warm scopes in shared mode", "bad limits"} {
 		t.Run(name, func(t *testing.T) {
 			app, cfg, _, _ := privateSearchFixture(t)
 			idx := cfg.Search.Indexes["published"]
@@ -293,6 +293,12 @@ func TestPrivateSearchHTTPRejectsConfiguration(t *testing.T) {
 				idx.Where = "EXISTS (SELECT 1 FROM space_members m WHERE m.created > '')"
 			case "members without scope":
 				idx.Scope, idx.Members = nil, "all"
+			case "warm scopes without background":
+				idx.SnapshotScopeWhere = "publications.space = 'alpha'"
+			case "warm scopes in shared mode":
+				cfg.Snapshot = nil
+				idx.Isolation, idx.Members, idx.Where = "", "", ""
+				idx.SnapshotScopeWhere = "publications.space = 'alpha'"
 			case "limits in shared mode":
 				cfg.Snapshot = nil
 				cfg.Search = &searchread.Config{Indexes: map[string]searchread.Index{"deals": {Table: "deal_search", Collection: "pages", Columns: []string{"title"}, SnippetColumn: "title"}}, CacheBytes: 1 << 20}
@@ -340,7 +346,7 @@ func TestExistingConfigurationShapesLoad(t *testing.T) {
 						t.Fatalf("shared index encoding changed: %s", encoded)
 					}
 				}
-				if discovery, _ := json.Marshal(searchDiscovery(*cfg.Search, cfg.MaxRows)); strings.Contains(string(discovery), "isolation") || strings.Contains(string(discovery), "maxIndexBytes") {
+				if discovery, _ := json.Marshal(searchDiscovery(*cfg.Search, cfg.MaxRows, false)); strings.Contains(string(discovery), "isolation") || strings.Contains(string(discovery), "maxIndexBytes") {
 					t.Fatalf("shared discovery changed: %s", discovery)
 				}
 			}

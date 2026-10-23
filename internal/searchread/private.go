@@ -100,6 +100,9 @@ func validatePrivateIndex(i Index) error {
 	if i.Where != "" && strings.TrimSpace(i.Where) == "" {
 		return fmt.Errorf("%w: empty where predicate", ErrIndexInvalid)
 	}
+	if i.SnapshotScopeWhere != "" && (i.Scope == nil || strings.TrimSpace(i.SnapshotScopeWhere) == "") {
+		return fmt.Errorf("%w: snapshotScopeWhere requires a scope and nonempty predicate", ErrIndexInvalid)
+	}
 	for _, c := range i.Columns {
 		if strings.EqualFold(c, privateTable) {
 			return fmt.Errorf("%w: column names", ErrIndexInvalid)
@@ -115,13 +118,15 @@ func privateShape(i Index) Index {
 }
 
 type privateDefinition struct {
-	index               Index
-	rows, scope         *sqlread.FilteredRead
-	ddl, insert, search string
+	index                                   Index
+	rows, scope                             *sqlread.FilteredRead
+	snapshotRows, snapshotScope, warmScopes *sqlread.SnapshotRead
+	ddl, insert, search                     string
 }
 
-// PrivateEngine searches per-request in-memory indexes built only from rows
-// that a filtered snapshot source authorizes for the requester.
+// PrivateEngine searches indexes built only from rows that a filtered snapshot
+// source authorizes. Background snapshots own disk indexes; synchronous mode
+// retains the per-request authorization read and in-memory index cache.
 type PrivateEngine struct {
 	source        *sqlread.SnapshotSource
 	indexes       map[string]privateDefinition
@@ -130,6 +135,8 @@ type PrivateEngine struct {
 	cache         *ftsCache
 	builds        chan struct{}
 	requests      chan struct{}
+	diskMu        sync.Mutex
+	diskBuilding  map[string]chan struct{}
 }
 
 // NewPrivate validates private indexes against source. Every source column
@@ -159,7 +166,7 @@ func NewPrivate(source *sqlread.SnapshotSource, cfg Config, limits Limits) (*Pri
 	}
 	defer scratch.Close()
 	scratch.SetMaxOpenConns(1)
-	e := &PrivateEngine{source: source, indexes: map[string]privateDefinition{}, limits: limits, maxIndexBytes: cfg.MaxIndexBytes, cache: newFTSCache(cfg.CacheBytes, MaxCacheEntries), builds: make(chan struct{}, privateBuilds), requests: make(chan struct{}, privateRequests)}
+	e := &PrivateEngine{source: source, indexes: map[string]privateDefinition{}, limits: limits, maxIndexBytes: cfg.MaxIndexBytes, cache: newFTSCache(cfg.CacheBytes, MaxCacheEntries), builds: make(chan struct{}, privateBuilds), requests: make(chan struct{}, privateRequests), diskBuilding: map[string]chan struct{}{}}
 	for alias, idx := range cfg.Indexes {
 		idx.Columns = append([]string(nil), idx.Columns...)
 		idx.Weights = append([]float64(nil), idx.Weights...)
@@ -220,17 +227,42 @@ func NewPrivate(source *sqlread.SnapshotSource, cfg Config, limits Limits) (*Pri
 		}(); err != nil {
 			return nil, fmt.Errorf("%w: search index %q: %v", ErrIndexInvalid, alias, err)
 		}
-		def.rows, err = source.PrepareFilteredRead(sqlread.FilteredReadSpec{Table: idx.Collection, Columns: append([]string{"id"}, idx.Columns...), Where: idx.Where})
-		if err != nil {
-			return nil, fmt.Errorf("search index %q: %w", alias, err)
-		}
-		if idx.Scope != nil {
-			def.scope, err = source.PrepareFilteredRead(sqlread.FilteredReadSpec{Table: idx.Scope.Collection, Columns: []string{idx.Scope.Field}})
+		if source.BackgroundEnabled() {
+			def.snapshotRows, err = source.PrepareSnapshotRead(sqlread.FilteredReadSpec{Table: idx.Collection, Columns: append([]string{"id"}, idx.Columns...), Where: idx.Where})
 			if err != nil {
-				return nil, fmt.Errorf("search index %q scope: %w", alias, err)
+				return nil, fmt.Errorf("search index %q: %w", alias, err)
+			}
+			if idx.Scope != nil {
+				def.snapshotScope, err = source.PrepareSnapshotRead(sqlread.FilteredReadSpec{Table: idx.Scope.Collection, Columns: []string{idx.Scope.Field}})
+				if err != nil {
+					return nil, fmt.Errorf("search index %q scope: %w", alias, err)
+				}
+				if idx.SnapshotScopeWhere != "" {
+					def.warmScopes, err = source.PrepareSnapshotRead(sqlread.FilteredReadSpec{Table: idx.Scope.Collection, Columns: []string{"id"}, Where: idx.SnapshotScopeWhere})
+					if err != nil {
+						return nil, fmt.Errorf("search index %q warm scopes: %w", alias, err)
+					}
+				}
+			}
+		} else {
+			if idx.SnapshotScopeWhere != "" {
+				return nil, fmt.Errorf("search index %q: snapshotScopeWhere requires background snapshots", alias)
+			}
+			def.rows, err = source.PrepareFilteredRead(sqlread.FilteredReadSpec{Table: idx.Collection, Columns: append([]string{"id"}, idx.Columns...), Where: idx.Where})
+			if err != nil {
+				return nil, fmt.Errorf("search index %q: %w", alias, err)
+			}
+			if idx.Scope != nil {
+				def.scope, err = source.PrepareFilteredRead(sqlread.FilteredReadSpec{Table: idx.Scope.Collection, Columns: []string{idx.Scope.Field}})
+				if err != nil {
+					return nil, fmt.Errorf("search index %q scope: %w", alias, err)
+				}
 			}
 		}
 		e.indexes[alias] = def
+	}
+	if source.BackgroundEnabled() {
+		source.SetSnapshotInitializer(e.prepareSnapshotIndexes)
 	}
 	return e, nil
 }
@@ -245,8 +277,8 @@ type privateRow struct {
 	values []string
 }
 
-// SearchAs searches index content visible to requester. Authorization reads
-// run on every request before any cache lookup.
+// SearchAs searches index content visible in the requester's authorized
+// snapshot. Synchronous mode checks live authorization before cache lookup.
 func (e *PrivateEngine) SearchAs(ctx context.Context, requester string, req Request) (Result, error) {
 	result := Result{Index: req.Index, Hits: []Hit{}}
 	d, ok := e.indexes[req.Index]
@@ -277,6 +309,9 @@ func (e *PrivateEngine) SearchAs(ctx context.Context, requester string, req Requ
 	if requester == "" {
 		return result, ErrInvalidQuery
 	}
+	if !e.source.BackgroundEnabled() && (req.Consistency != "" || req.AtLeast != "" || req.SnapshotGeneration != "") {
+		return result, ErrInvalidQuery
+	}
 	// Admission precedes reading content, so queued requests retain no corpus.
 	waitCtx, waitCancel := context.WithTimeout(ctx, e.limits.Timeout)
 	select {
@@ -288,6 +323,9 @@ func (e *PrivateEngine) SearchAs(ctx context.Context, requester string, req Requ
 		return result, err
 	}
 	defer func() { <-e.requests }()
+	if e.source.BackgroundEnabled() {
+		return e.searchSnapshot(ctx, requester, req, d, match, limit)
+	}
 	rows, err := e.authorizedRows(ctx, requester, d, req.Scope)
 	if err != nil {
 		return result, err

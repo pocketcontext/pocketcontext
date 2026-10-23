@@ -43,6 +43,9 @@ func TestMaintenanceRequestDrain(t *testing.T) {
 }
 
 func TestMaintenanceReadClassification(t *testing.T) {
+	if !maintenanceRead(httptest.NewRequest(http.MethodGet, "/api/context/snapshot", nil)) {
+		t.Fatal("blocked snapshot status during maintenance")
+	}
 	for _, p := range []string{"/api/context/query", "/api/context/search", "/api/files/token", "/api/realtime", "/api/collections/users/auth-refresh"} {
 		if !maintenanceRead(httptest.NewRequest(http.MethodPost, p, nil)) {
 			t.Fatalf("blocked reader %s", p)

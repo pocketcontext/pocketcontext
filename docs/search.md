@@ -4,8 +4,9 @@ PocketContext offers full-text search through a separate authenticated endpoint.
 It is opt-in. Shared-workspace applications use application-maintained shared
 indexes: all accounts in the configured auth collection can search every
 configured index. Filtered-snapshot applications use
-[private indexes](#private-search-for-filtered-snapshots), built per request
-from rows the requester may read. PocketBase record API rules filter neither
+[private indexes](#private-search-for-filtered-snapshots), built from rows the
+requester may read. Background snapshots store their indexes on disk; the default
+synchronous mode uses an in-memory cache. PocketBase record API rules filter neither
 mode. A `snapshot` configuration accepts only private indexes; shared-workspace
 configurations accept only shared indexes.
 
@@ -215,8 +216,10 @@ it is not exposed as an alternate SQL endpoint.
 Applications with a `snapshot` configuration may enable search only with
 private indexes. Results, excerpts, scores, ordering, `hasMore` and generation
 tokens then depend only on rows the requester's snapshot filters admit. There is
-no application-maintained FTS table: each request reads authorized rows and
-searches an in-memory FTS5 index built from exactly those rows.
+no application-maintained FTS table. By default, each request reads authorized
+rows and searches an in-memory FTS5 index built from exactly those rows.
+[Background snapshots](#background-snapshots-and-disk-backed-search) instead
+stream authorized rows into generation-owned files.
 
 ```json
 {
@@ -270,12 +273,17 @@ Index fields:
 - Optional `where` is a trusted predicate on the source table that narrows rows.
   It follows snapshot filter rules: one expression, may bind only `:requester`,
   and may reference only configured columns and policy tables. It never widens
-  the source filter.
+  the source filter. In background mode, it may reference only exported tables
+  and columns: policy-only tables are absent from the completed snapshot.
+- Optional `snapshotScopeWhere` selects scope rows to index before publishing a
+  background snapshot. It requires both `scope` and `snapshot.background`; see
+  below. Shared indexes and synchronous private indexes reject it.
 
 Search-level limits: `maxIndexBytes` (default 8 MiB, 1 KiB to 64 MiB) caps the
 UTF-8 bytes of IDs and indexed values read for one request. `cacheBytes`
 (default 64 MiB, from `maxIndexBytes` to 1 GiB) bounds the cache described
-below. Both are rejected in shared-workspace mode.
+below. Both are rejected in shared-workspace mode. Background mode accepts these
+settings for configuration compatibility but uses the snapshot disk budget instead.
 
 ### Authorization semantics
 
@@ -284,7 +292,7 @@ for scoped indexes and rejected otherwise; `offset` is 0 to 10,000 and positive
 offsets require `expectedGeneration`. Scope-less private indexes also return a
 generation and support stable pagination.
 
-Every request runs one filtered snapshot read transaction for the authenticated
+In the default synchronous mode, every request runs one filtered snapshot read transaction for the authenticated
 account, sharing the snapshot slots, timeout and `maxRows`/`maxBytes` limits:
 
 1. A scoped request reads the scope row through the scope table's filter. A
@@ -309,7 +317,7 @@ return generic 503.
 The generation is a SHA-256 fingerprint of the private ranking contract version,
 SQLite version/source identity, index configuration, scope ID (or a scope-less
 marker) and every included row's ID and indexed values, sorted by ID. A fresh
-in-memory FTS5 table with the canonical shape and `unicode61` tokenizer is filled
+FTS5 table with the canonical shape and `unicode61` tokenizer is filled
 in ID order, made `query_only` and queried with the same fixed BM25, snippet and
 `ORDER BY score, record_id` query as shared search. BM25 statistics therefore
 come only from the requester's included rows. Two accounts with identical
@@ -332,8 +340,94 @@ indexes that are still in use remain alive until their requests finish, so
 The authorization read uses the snapshot timeout; index build and ranking then
 use the configured query `timeoutMs`. Responses keep the `maxBytes` limit.
 
+### Background snapshots and disk-backed search
+
+Opting into [`snapshot.background`](filtered-snapshots.md) switches private search
+to SQLite FTS5 files alongside each requester's complete SQL snapshot. SQL and
+search read the same immutable, authorized generation; neither search nor caller
+SQL attaches the source database. The server streams rows into the index instead
+of retaining the complete text corpus in Go memory. Only fixed, parameterized
+search queries can access these files. Their FTS tables and internal metadata
+remain absent from the arbitrary SQL endpoint.
+
+All unscoped indexes are built before a new snapshot is published. Scoped indexes
+may select frequently used scopes with a trusted `snapshotScopeWhere` predicate.
+For example, an application can prepare its latest publication in every visible
+space:
+
+```json
+"snapshotScopeWhere": "publications.sequence = (SELECT max(p.sequence) FROM publications p WHERE p.space = publications.space)"
+```
+
+The scope collection's `sequence` and `space` columns must be configured snapshot
+outputs. The predicate is startup-validated, can bind only `:requester`, and can
+read only exported tables and columns. It selects from the already authorized
+snapshot and cannot widen access. There is a maximum of 10,000 prepared scopes
+per index. The server has no built-in publication or space rules.
+
+The SQL generation becomes available only after every selected index finishes.
+A failed primary index build leaves the previous complete SQL/search generation
+available. Other scopes, such as historical publications, are indexed on their
+first search and cached within that generation. A failed historical build removes
+its partial file and leaves the SQL generation usable. Each scope gets its own
+FTS corpus, so BM25 statistics exclude both invisible and unselected records.
+The existing `members: "all"` and `"visible"` rules still apply.
+
+Search accepts the background SQL freshness options `consistency` (`"available"`
+or `"fresh"`), `atLeast` and `snapshotGeneration`. The response includes a
+`snapshot` object with the SQL generation, capture time, refreshing/stale flags,
+row and disk counts, and any last build error. The same snapshot headers as SQL
+are returned. `snapshotGeneration` requires that exact current snapshot and
+returns 409 after it has been replaced; it does not reopen retired generations.
+`atLeast` permits a newer snapshot and is useful for reading SQL records after
+search. These request fields are rejected outside background private search.
+
+The top-level search `generation` remains a fingerprint of the included text and
+ranking configuration. It is distinct from `snapshot.generation`: unrelated
+source changes may replace the SQL snapshot without changing scoped search
+ranking. Continue pagination with `expectedGeneration`; restart after a 409.
+Adding `snapshotGeneration` also rejects unrelated snapshot replacements.
+
+Available reads may serve the previous completed generation while a replacement
+builds. Data, grants and revocations therefore have the same eventual freshness
+as background SQL. Ordinary authentication and separate REST/file checks remain
+live; callers must handle a search result that is no longer available through
+those interfaces. Use `consistency: "fresh"` when an operation needs to observe
+source changes committed before its freshness check.
+
+The legacy `maxIndexBytes`, `cacheBytes`, snapshot `maxRows` and snapshot
+`maxBytes` limits do not cap these streamed indexes. Instead,
+`snapshot.background.maxDiskBytes` and `minFreeBytes` cover the combined SQL and
+FTS files, including current, building and still-leased retired generations.
+`maxValueBytes` bounds individual source values. Scope JSON retains its 10,000
+entries and 4 MiB limit. Physical index exhaustion returns the snapshot
+storage-unavailable 503 response; indexes never become partial search results.
+Historical index files remain until their generation is removed, so searching
+many historical scopes can consume the shared disk budget.
+
+Primary and historical index builds use `buildTimeoutMs` (default 120 seconds); a historical request's
+cancellation also cancels its build. Ranking then gets its own query `timeoutMs`,
+and response limits remain unchanged. The worker and index-build limits are upper
+bounds: disk growth is serialized while one build reserves the remaining global
+budget. Other builds wait with cancellation until that reservation is released.
+FTS connections use a small pager
+cache, disable mmap and use disk temporary storage; these settings do not remove
+SQLite's process-wide heap limit or make CPU and memory costs independent of
+document size. SQLite snippet generation for heavily repeated matches may defer
+cancellation until its current callback returns; the deadline is not hard
+wall-clock preemption. Benchmark representative documents, scopes and concurrent users.
+
+Completed index files have private permissions and are atomically renamed into
+place. A search holds a generation lease through ranking and closes its FTS
+connection before releasing the lease. Obsolete SQL and search files are removed
+after their final reader finishes. No open FTS connection is retained by the
+legacy in-memory cache in this mode.
+
 ### Residual risks and scaling
 
+- The per-request scans and memory-cache limits below describe the default
+  synchronous mode. Background mode instead follows the disk budgets and
+  eventual authorization semantics above.
 - Timing reflects server load and cache state. A cache hit can reveal that some
   account recently searched identical content, which the requester can already
   read. Other accounts' corpus size does not affect authorized reads or ranking,

@@ -23,14 +23,20 @@ func volatileSnapshotFunction(name string) bool {
 }
 
 type snapshotEntry struct {
-	engine   *Engine
-	dir      string
-	at       time.Time
-	state    snapshotState
-	sizes    map[string]tableSize
-	refs     int
-	retained bool
-	used     time.Time
+	engine     *Engine
+	dir        string
+	at         time.Time
+	state      snapshotState
+	sizes      map[string]tableSize
+	refs       int
+	retained   bool
+	used       time.Time
+	requester  string
+	generation string
+	sequence   uint64
+	epoch      uint64
+	diskBytes  int64
+	diskBudget int64
 }
 
 // version is always read on the same dedicated physical connection. Values
@@ -177,9 +183,13 @@ func (s *SnapshotSource) acquireSnapshot(ctx context.Context, requester string) 
 }
 
 func (s *SnapshotSource) buildSnapshot(ctx context.Context, requester string, base *snapshotEntry, changed map[string]bool) (*snapshotEntry, error) {
-	dir, err := os.MkdirTemp(s.root, "request-")
-	if err != nil {
-		return nil, err
+	dir, ok := ctx.Value(snapshotDirectoryKey{}).(string)
+	var err error
+	if !ok {
+		dir, err = os.MkdirTemp(s.root, "request-")
+		if err != nil {
+			return nil, err
+		}
 	}
 	success := false
 	defer func() {

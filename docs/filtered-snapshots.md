@@ -1,6 +1,6 @@
 # Filtered snapshots
 
-Filtered snapshots let authenticated accounts query different subsets of application data with SQL. The application defines the rows and columns each requester may read. PocketContext copies those rows into a private SQLite database, then runs the agent's SQL against that database using its existing read restrictions. It reuses the authenticated requester's copy while the source database remains unchanged.
+Filtered snapshots let authenticated accounts query different subsets of application data with SQL. The application defines the rows and columns each requester may read. PocketContext copies those rows into a private SQLite database, then runs the agent's SQL against that database using its existing read restrictions. The default synchronous mode reuses the requester's copy while the source database remains unchanged. Optional background mode serves completed generations while building their replacements.
 
 This is an optional mode. Existing configurations without `snapshot` retain shared-workspace access.
 
@@ -41,7 +41,131 @@ Each `tables` entry needs an explicit, nonempty column list and a nonempty `filt
 
 For a management hierarchy, an application can maintain grants for each direct and indirect manager or express that relationship in its filters. HR membership and access to one's own records are separate policy decisions. PocketContext does not infer them or maintain the hierarchy. A grant table must be updated consistently with the relationships it represents.
 
-## Request lifecycle
+## Background refresh
+
+Applications enable background refresh explicitly by adding a `background`
+object inside `snapshot`. Existing configurations retain synchronous behavior.
+For example:
+
+```json
+"background": {
+  "maxDiskBytes": 1073741824,
+  "minFreeBytes": 268435456,
+  "buildTimeoutMs": 120000,
+  "maxBuilders": 1,
+  "maxCachedUsers": 16,
+  "refreshIntervalMs": 1000,
+  "retryDelayMs": 1000,
+  "maxValueBytes": 16777216
+}
+```
+
+These values are the defaults. Each generation is a complete, private,
+file-backed SQLite database. Construction exports all configured tables from
+one source read transaction and creates the authorized indexes before the new
+generation can serve queries. A completed replacement becomes current
+atomically; queries already using its predecessor finish on that unchanged
+file. Files are removed after their final reader releases them.
+
+Background construction does not apply the legacy `snapshot.maxRows` and
+`snapshot.maxBytes` corpus limits. Those settings continue to bound trusted
+`ReadFiltered` operations. Full builds instead use a disk budget, a free-space
+reserve, a separate build deadline and bounded builder concurrency.
+`maxValueBytes` limits individual SQLite value/row allocation during export;
+it is independent of total corpus size. Normal SQL execution and response
+limits still apply.
+
+Background reads are eventually consistent, including membership and other
+row-policy changes. An available generation can retain rows removed by a later
+policy change until refresh completes. PocketBase still authenticates each
+request independently; background copies do not bypass invalid or revoked
+account tokens. REST, realtime and protected-file authorization remain separate
+from the SQL generation.
+
+Source changes schedule replacement builds without blocking readers of an
+existing generation. Concurrent requests coordinate one build per requester.
+A failed refresh preserves the previous completed generation; status reports
+its refresh state and last error. A new requester, an evicted requester, or a
+server restart may have no completed generation yet. Temporary generations are
+not recovered across restart.
+
+Disk growth reservations are serialized so two builders cannot spend the same
+remaining capacity. `maxBuilders` bounds workers, including workers waiting for
+that reservation; raising it does not create parallel disk construction. Cached
+users are evicted by `maxCachedUsers`, not automatically by disk pressure. A full
+cache can therefore delay freshness until space is available or its budget is
+increased. Active readers retain their old files until they finish.
+
+The budget accounts for private generation files. Source databases/WAL, SQLite
+temporary working files and unrelated host storage need separate capacity.
+The free-space reserve is checked before growth; it is not a filesystem quota.
+
+### Read consistency and generations
+
+`POST /api/context/query` accepts these optional fields in background mode:
+
+| Field | Meaning |
+| --- | --- |
+| `consistency` | `available` (default) reads a completed generation; `fresh` waits for a generation that satisfies the request's freshness barrier. |
+| `atLeast` | Require at least a previously returned generation for this requester. This is a snapshot-generation token, not a write receipt. |
+| `expectedGeneration` | Require that exact current generation; a change returns 409 so a multi-request read can restart. |
+
+Use `fresh` for verification after writes and conflict recovery. It observes a
+source-version barrier when the request starts and can reuse a generation that
+already covers that barrier. New writes during construction do not move that
+target indefinitely. Waiting for a fresh generation uses `buildTimeoutMs`;
+waiting for an initially unavailable copy uses `snapshot.timeoutMs`. Ordinary
+available reads can return older data while a refresh is running. Generation
+checks do not accept another requester's token and do not grant access to
+another account's data.
+
+```json
+{"sql":"SELECT id,title FROM documents ORDER BY id","consistency":"fresh"}
+```
+
+JSON query results retain `columns`, `rows`, and `truncated`, and add `snapshot`
+metadata containing `generation`, `capturedAt`, `refreshing`, `stale`, `rows`,
+`diskBytes`, and an optional `lastError`. Snapshot `rows` counts the exported
+corpus; it is distinct from the number of query-result rows. `capturedAt`
+describes the source read transaction. It is not a write watermark. Before the
+first generation exists, status omits `generation`, uses zero row/byte counts
+and an unset capture time. Generation tokens expire across server restarts.
+
+Both JSON and CSV responses expose `X-Context-Snapshot-Generation`,
+`X-Context-Snapshot-At`, `X-Context-Snapshot-Stale`,
+`X-Context-Snapshot-Refreshing`, `X-Context-Snapshot-Rows`, and
+`X-Context-Snapshot-Disk-Bytes` through CORS. CSV bodies contain only query
+results. `GET /api/context/snapshot` returns the authenticated requester's
+metadata and schedules needed refresh work without waiting for its completion.
+No requester identifier is accepted as an authorization override. The route is
+available only when background snapshots are enabled and uses
+`Cache-Control: no-store`.
+
+Schema discovery retains `permissionModel: "filtered-snapshot"` and adds a
+`snapshot` descriptor with background resources, supported consistency options
+and the status route. `snapshotLimits.maxRows` and `maxBytes` still describe
+trusted filtered-read bounds, rather than a full-generation ceiling.
+`snapshotLimits.timeoutMs` also bounds an initially unavailable read's wait;
+concurrency settings still control admitted SQL and trusted search reads.
+Discovery exposes no policy predicates or policy-only collections.
+
+| HTTP status and code | Meaning |
+| --- | --- |
+| 503 `snapshot_pending` | The required completed generation is not ready; retry the read. |
+| 503 `snapshot_resource_limit` | A refresh cannot obtain the required server resources. |
+| 409 `snapshot_generation_conflict` | The requested generation cannot be used; restart the read against a suitable current generation. |
+| 413 `result_limit` | Final encoded query/search output exceeds its response budget. |
+
+The 503 responses include `Retry-After: 1`. A resource failure is not a request
+to shrink the result page: the refresh budget and response budget are separate.
+Query timeouts, authentication failures and existing SQL restrictions retain
+their normal behavior. Synchronous snapshots accept `consistency` without
+changing their freshness contract; generation checks require background mode.
+Shared-workspace SQL rejects snapshot-specific options.
+
+## Synchronous request lifecycle
+
+The following lifecycle applies when `snapshot.background` is absent.
 
 1. Authenticate through the normal PocketBase token mechanism.
 2. Check optional per-account admission, acquire a snapshot concurrency slot, and check the source database's commit version.
@@ -87,7 +211,7 @@ Snapshots copy selected column names, declared types, and stored values. At star
 
 Snapshots do not copy source constraints, triggers, column collations or custom collations. Queries over unusual source collations may therefore behave differently; ordinary PocketBase field tables use the supported default semantics. Source rowids are not an exported identity: use the configured record `id` column. Restart after source schema or index changes.
 
-## Limits and failures
+## Synchronous limits and failures
 
 Snapshot limits are separate from the existing query result limits:
 
@@ -118,13 +242,16 @@ CGO_ENABLED=1 go test -tags sqlite_math_functions,sqlite_percentile,sqlite_fts5 
 
 `SnapshotSource.ReadFiltered` gives trusted server features one source read transaction for the authenticated requester. Reads are declared at startup with `PrepareFilteredRead`: an output table, configured output columns and an optional trusted predicate that follows filter rules. Each read applies the table's snapshot filter, optionally restricted to a list of record IDs bound through the built-in `json_each`. The ID-list permission exists only on the connection held for that transaction. Filtered reads share the snapshot concurrency slots, timeout and `maxRows`/`maxBytes` accounting, and fail without partial results in the same way as exports. A table or view named `json_each` makes them fail.
 
-Search with filtered snapshots uses these reads to build [private indexes](search.md#private-search-for-filtered-snapshots). Shared search indexes are rejected with `snapshot`.
+Synchronous private search uses these reads to build [private indexes](search.md#private-search-for-filtered-snapshots). Background private search uses the requester's leased generation; see the search contract for its separate generation and pagination fields. Shared search indexes are rejected with `snapshot`.
 
 ## Optional transactional change tracking
 
 Set `snapshot.trackChanges` to `true` to track changes to configured output and
 policy tables and the authentication collection. The default remains `false`,
 using global `data_version` invalidation without changing the source schema.
+
+The refresh and immediate-freshness details in this section describe synchronous
+mode. Background mode retains the eventual-consistency contract above.
 
 On first enabled startup, the ordinary application writer installs the internal
 `_context_snapshot_versions` table and three server-owned triggers per tracked
@@ -166,12 +293,29 @@ matching membership sets alone do not establish identical visibility.
 
 ## Authorization and freshness
 
-SQL snapshots are reused only after a fresh source-version check. Private search
+Synchronous SQL snapshots are reused only after a fresh source-version check. Synchronous private search
 independently reads current authorized source rows before looking up an FTS index
 by content fingerprint; it does not construct the cached SQL snapshot. A request
 already in progress can finish using its captured policy and data. The snapshot
 timestamp describes the capture's start, not a guarantee of revocation at response
 delivery. Previously delivered results cannot be revoked.
+
+Background mode deliberately permits older completed generations for available
+reads, including their captured row-policy decisions. Use its generation and
+freshness metadata when coordinating reads with writes.
+
+A synthetic cold-build check is available for a corpus beyond the former
+100,000-row/64-MiB ceilings:
+
+```sh
+CGO_ENABLED=1 go test -tags sqlite_math_functions,sqlite_percentile,sqlite_fts5 ./internal/sqlread \
+  -run '^$' -bench '^BenchmarkBackgroundSnapshotLarge$' -benchtime=1x
+```
+
+On the development ARM64 host, one run captured all 120,000 rows and 122,880,000
+body bytes in 0.91 seconds, with a 167,124,992-byte indexed snapshot. This is a
+synthetic SQL export measurement, not a WikiContext publication/FTS benchmark or
+a latency guarantee.
 
 Filters are the authorization policy for SQL. PocketBase record API rules are not evaluated during export. Protect list/view routes, files, custom endpoints, and writes to roles or relationships separately. Agents must use individual account tokens; a shared service token gives every caller that account's visibility. An incorrect filter can authorize too much data, so application tests should cover both permitted and denied relationships.
 
