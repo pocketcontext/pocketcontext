@@ -83,7 +83,7 @@ if not source.is_file():
     raise SystemExit('missing local release fixture: ' + name)
 output.write_bytes(source.read_bytes())
 """)
-        self.payload = f"#!/bin/sh\nprintf '%s\\n' 'pocketcontext {VERSION} (PocketBase v0.40.4; commit synthetic)'\n".encode()
+        self.payload = f"#!/bin/sh\nprintf '%s\\n' 'pocketcontext {VERSION} (PocketBase v0.41.1; commit synthetic)'\n".encode()
         self.archive_name = self.archive_for(os_name, machine)
         self.archive([(tarfile.REGTYPE, "pocketcontext", self.payload)])
 

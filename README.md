@@ -40,7 +40,7 @@ an archive and `checksums.txt` from [GitHub Releases](https://github.com/pocketc
 For example:
 
 ```sh
-curl -fL -o install.sh https://github.com/pocketcontext/pocketcontext/releases/download/v0.9.1/install.sh
+curl -fL -o install.sh https://github.com/pocketcontext/pocketcontext/releases/download/v0.9.2/install.sh
 # Inspect install.sh, then:
 sh install.sh
 ```

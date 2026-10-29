@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/pocketbase/pocketbase/core"
+	"ganigeorgiev.com/pocketbase/pocketbase/core"
 	"github.com/pocketcontext/pocketcontext/internal/sqlread"
 )
 

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pocketbase/pocketbase"
-	"github.com/pocketbase/pocketbase/core"
+	"ganigeorgiev.com/pocketbase/pocketbase"
+	"ganigeorgiev.com/pocketbase/pocketbase/core"
 	"github.com/pocketcontext/pocketcontext/internal/database"
 )
 

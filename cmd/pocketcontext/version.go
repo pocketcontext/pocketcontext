@@ -15,7 +15,7 @@ func versionDetails() string {
 	revision := commit
 	if info, ok := debug.ReadBuildInfo(); ok {
 		for _, dependency := range info.Deps {
-			if dependency.Path == "github.com/pocketbase/pocketbase" {
+			if dependency.Path == "ganigeorgiev.com/pocketbase/pocketbase" {
 				pocketBaseVersion = dependency.Version
 				if dependency.Replace != nil {
 					pocketBaseVersion += " (replaced)"
