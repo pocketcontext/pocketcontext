@@ -4,7 +4,6 @@
 import argparse
 import hashlib
 import io
-import os
 from pathlib import Path
 import platform
 import shutil
@@ -27,15 +26,17 @@ class InstallerFixture:
         self.checksum = checksum or ("sha256sum" if shutil.which("sha256sum") else "shasum")
         self.temporary = tempfile.TemporaryDirectory(prefix="pocketcontext-installer-test-")
         self.root = Path(self.temporary.name)
-        self.home = self.root / "home with spaces $(false)"
+        self.home = self.root / "home"
         self.home.mkdir()
+        self.project = self.root / "project with spaces $(false)"
+        self.project.mkdir()
         self.downloads = self.root / "downloads"
         self.downloads.mkdir()
         self.temporary_files = self.root / "temporary files"
         self.temporary_files.mkdir()
         self.tools = self.root / "tools"
         self.tools.mkdir()
-        self.destination = self.home / ".local" / "bin" / "pocketcontext"
+        self.destination = self.project / "pocketcontext"
         self.log = self.root / "requests.log"
         self.script = TEMPLATE.read_text().replace("@VERSION@", VERSION).encode()
         self.environment = {
@@ -134,7 +135,7 @@ output.write_bytes(source.read_bytes())
     def run(self, script=None):
         return subprocess.run(
             ["/bin/sh"], input=self.script if script is None else script,
-            cwd=self.root, env=self.environment, capture_output=True, timeout=20,
+            cwd=self.project, env=self.environment, capture_output=True, timeout=20,
         )
 
     def close(self):
@@ -170,7 +171,9 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr.decode())
                 self.assertEqual(fixture.destination.read_bytes(), fixture.payload)
                 self.assertEqual(stat.S_IMODE(fixture.destination.stat().st_mode), 0o755)
-                self.assertIn(b'export PATH="$HOME/.local/bin:$PATH"', result.stdout)
+                self.assertIn(f"at {fixture.destination}\n".encode(), result.stdout)
+                self.assertIn(f"data directory is {fixture.project}/pb_data\n".encode(), result.stdout)
+                self.assertEqual(list(fixture.home.iterdir()), [])
                 self.assertEqual(fixture.log.read_text().splitlines(), [
                     f"https://github.com/pocketcontext/pocketcontext/releases/download/v{VERSION}/{name}"
                     for name in ("checksums.txt", fixture.archive_name)
@@ -180,12 +183,47 @@ class InstallerTests(unittest.TestCase):
     def test_existing_binary_is_replaced(self):
         fixture = self.fixture()
         fixture.existing()
-        fixture.environment["PATH"] += os.pathsep + str(fixture.destination.parent)
         result = fixture.run()
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(fixture.destination.read_bytes(), fixture.payload)
-        self.assertNotIn(b"Add it to PATH", result.stdout)
+        self.assertEqual(stat.S_IMODE(fixture.destination.stat().st_mode), 0o755)
         self.assert_clean(fixture)
+
+    def test_install_directory_option(self):
+        for kind in ("relative", "absolute", "new", "dash"):
+            with self.subTest(kind=kind):
+                fixture = self.fixture()
+                target = {
+                    "relative": fixture.project / "app",
+                    "absolute": fixture.root / "elsewhere with spaces",
+                    "new": fixture.project / "new" / "nested",
+                    "dash": fixture.project / "-app",
+                }[kind]
+                if kind in ("relative", "absolute", "dash"):
+                    target.mkdir()
+                fixture.environment["POCKETCONTEXT_INSTALL_DIR"] = (
+                    str(target) if kind == "absolute" else str(target.relative_to(fixture.project)))
+                result = fixture.run()
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                self.assertEqual((target / "pocketcontext").read_bytes(), fixture.payload)
+                self.assertIn(f"at {target}/pocketcontext\n".encode(), result.stdout)
+                self.assertFalse(fixture.destination.exists())
+                self.assertEqual(list(target.glob(".pocketcontext.*")), [])
+                self.assert_clean(fixture)
+
+    def test_invalid_install_directory_fails_before_download(self):
+        for kind in ("empty", "file"):
+            with self.subTest(kind=kind):
+                fixture = self.fixture()
+                if kind == "file":
+                    (fixture.project / "file").write_bytes(b"not a directory")
+                fixture.environment["POCKETCONTEXT_INSTALL_DIR"] = "" if kind == "empty" else "file"
+                result = fixture.run()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"must not be empty" if kind == "empty" else b"is not a directory", result.stderr)
+                self.assertFalse(fixture.log.exists())
+                self.assertFalse(fixture.destination.exists())
+                self.assert_clean(fixture)
 
     def test_shasum_fallback(self):
         fixture = self.fixture(checksum="shasum")
@@ -304,7 +342,6 @@ raise SystemExit(subprocess.call([{real_tar!r}] + sys.argv[1:]))
         for kind in ("symlink", "dangling", "directory"):
             with self.subTest(kind=kind):
                 fixture = self.fixture()
-                fixture.destination.parent.mkdir(parents=True)
                 outside = fixture.root / "outside"
                 outside.write_bytes(b"do not replace")
                 if kind == "directory":
@@ -318,14 +355,8 @@ raise SystemExit(subprocess.call([{real_tar!r}] + sys.argv[1:]))
                 self.assertFalse(fixture.log.exists())
                 self.assert_clean(fixture)
 
-    def test_invalid_home_and_unrendered_template(self):
+    def test_unrendered_template(self):
         fixture = self.fixture()
-        for value in ("", "relative/path"):
-            fixture.environment["HOME"] = value
-            result = fixture.run()
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn(b"HOME must be an absolute directory path", result.stderr)
-        fixture.environment["HOME"] = str(fixture.home)
         result = fixture.run(TEMPLATE.read_bytes())
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"invalid release version", result.stderr)

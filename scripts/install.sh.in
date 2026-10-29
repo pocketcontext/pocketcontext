@@ -1,6 +1,8 @@
 #!/bin/sh
 # Published installers contain a fixed release version. Download all assets from
 # that version, even if another release becomes latest while this script runs.
+# The executable goes into the current directory, or POCKETCONTEXT_INSTALL_DIR
+# when set, so its default data directory is pb_data beside it.
 
 pocketcontext_fail() {
     printf 'pocketcontext: %s\n' "$*" >&2
@@ -31,10 +33,11 @@ pocketcontext_install() (
     set -- $pc_version
     IFS=$pc_saved_ifs
     [ "$#" -eq 3 ] || pocketcontext_fail 'invalid release version'
-    case "${HOME:-}" in
-        /*) ;;
-        *) pocketcontext_fail 'HOME must be an absolute directory path' ;;
-    esac
+    pc_bindir=${POCKETCONTEXT_INSTALL_DIR-.}
+    [ -n "$pc_bindir" ] || pocketcontext_fail 'POCKETCONTEXT_INSTALL_DIR must not be empty'
+    if [ -e "$pc_bindir" ] && [ ! -d "$pc_bindir" ]; then
+        pocketcontext_fail "installation directory is not a directory: $pc_bindir"
+    fi
     for pc_tool in curl tar uname mktemp mkdir chmod mv rm; do
         command -v "$pc_tool" >/dev/null 2>&1 || pocketcontext_fail "required command is missing: $pc_tool"
     done
@@ -62,7 +65,6 @@ pocketcontext_install() (
         esac
         [ "$pc_macos_major" -ge 15 ] || pocketcontext_fail 'macOS 15 or newer is required'
     fi
-    pc_bindir=$HOME/.local/bin
     pc_destination=$pc_bindir/pocketcontext
     if [ -L "$pc_destination" ] || { [ -e "$pc_destination" ] && [ ! -f "$pc_destination" ]; }; then
         pocketcontext_fail "destination must be a regular file or absent: $pc_destination"
@@ -127,7 +129,9 @@ pocketcontext_install() (
         esac
     done < "$pc_tmp/details"
     [ "$pc_regular_count" -eq 3 ] || pocketcontext_fail 'invalid release archive listing'
-    mkdir -p "$pc_bindir" || pocketcontext_fail "could not create $pc_bindir"
+    mkdir -p -- "$pc_bindir" || pocketcontext_fail "could not create $pc_bindir"
+    pc_bindir=$(unset CDPATH; cd -- "$pc_bindir" && pwd -P) || pocketcontext_fail "could not resolve $pc_bindir"
+    pc_destination=$pc_bindir/pocketcontext
     pc_stage=$(mktemp "$pc_bindir/.pocketcontext.XXXXXXXX") || pocketcontext_fail 'could not create installation staging file'
     # Stream only the executable into our own file. Never let archive paths,
     # ownership or permission metadata control filesystem extraction.
@@ -140,10 +144,7 @@ pocketcontext_install() (
     mv -f "$pc_stage" "$pc_destination" || pocketcontext_fail 'could not replace executable'
     pc_stage=
     printf 'Installed PocketContext %s at %s\n' "$pc_version" "$pc_destination"
-    case ":${PATH:-}:" in
-        *":$pc_bindir:"*) ;;
-        *) printf '%s\n' 'Add it to PATH for this shell: export PATH="$HOME/.local/bin:$PATH"' ;;
-    esac
+    printf 'Its default data directory is %s/pb_data\n' "$pc_bindir"
 )
 
 pocketcontext_install "$@"

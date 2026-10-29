@@ -2,28 +2,35 @@
 
 PocketContext lets coding agents query application data with SQL. All writes use PocketBase's standard REST API.
 
-The server embeds PocketBase v0.40.4. By default, a separate read-only SQLite connection executes agent queries against the same database. Optional [filtered snapshots](docs/filtered-snapshots.md) copy rows permitted by application-defined filters into private databases per requester. Synchronous snapshots refresh after source commits; opt-in background snapshots serve completed generations while replacements build. No replication service is required. PocketContext has no application frontend. PocketBase's built-in administration dashboard remains available for server administration.
+The server embeds PocketBase v0.41.1. By default, a separate read-only SQLite connection executes agent queries against the same database. Optional [filtered snapshots](docs/filtered-snapshots.md) copy rows permitted by application-defined filters into private databases per requester. Synchronous snapshots refresh after source commits; opt-in background snapshots serve completed generations while replacements build. No replication service is required. PocketContext has no application frontend. PocketBase's built-in administration dashboard remains available for server administration.
 
 ## Install
+
+Run the installer from the application directory:
 
 ```sh
 curl -fsSL https://business.pocketcontext.com/pocketcontext/install.sh | sh
 ```
 
 The installer supports Linux amd64 and arm64, and macOS 15 or later on Apple
-Silicon. It installs the executable at `~/.local/bin/pocketcontext`, verifies the
-archive's SHA-256 checksum, and replaces an existing executable only after a
-successful download and verification. It needs `curl`, `tar`, and either
+Silicon. It installs the executable as `pocketcontext` in the current directory,
+verifies the archive's SHA-256 checksum, and replaces an existing executable only
+after a successful download and verification. It needs `curl`, `tar`, and either
 `sha256sum` or `shasum`. It does not require sudo or change shell profiles.
 
-If `~/.local/bin` is not on your PATH, add this to your shell configuration:
+The executable's default data directory is `pb_data` beside it, so each
+application directory holds its own server version and database. To install
+into another directory, set `POCKETCONTEXT_INSTALL_DIR`:
 
 ```sh
-export PATH="$HOME/.local/bin:$PATH"
+curl -fsSL https://business.pocketcontext.com/pocketcontext/install.sh | POCKETCONTEXT_INSTALL_DIR=path/to/app sh
 ```
 
+Keep the executable out of version control, for example by adding
+`/pocketcontext` to `.gitignore`.
+
 ```sh
-pocketcontext --version
+./pocketcontext --version
 ```
 
 Version output identifies PocketContext, the embedded PocketBase version, and
@@ -40,18 +47,19 @@ an archive and `checksums.txt` from [GitHub Releases](https://github.com/pocketc
 For example:
 
 ```sh
-curl -fL -o install.sh https://github.com/pocketcontext/pocketcontext/releases/download/v0.9.2/install.sh
+curl -fL -o install.sh https://github.com/pocketcontext/pocketcontext/releases/download/v0.9.3/install.sh
 # Inspect install.sh, then:
 sh install.sh
 ```
 
-Run the install command again to update to the latest release. Each published
-installer downloads assets from its own fixed version. Stop running servers
-before updating, back up their data, and follow each application's compatibility
-pin and migration instructions. Installing the server does not install an
-application or update its configuration, migrations, hooks, or database.
-Remove the executable with `rm "$HOME/.local/bin/pocketcontext"` to uninstall;
-application data remains in its configured directory.
+Run the install command again in the same directory to update to the latest
+release. Each published installer downloads assets from its own fixed version.
+Stop running servers before updating, back up their data, and follow each
+application's compatibility pin and migration instructions. Installing the server
+does not install an application or update its configuration, migrations, hooks,
+or database.
+Remove the executable with `rm ./pocketcontext` to uninstall; application data
+remains in its configured directory.
 
 ## Build
 
@@ -69,8 +77,8 @@ Applications own `pb_migrations`, optional `pb_hooks`, and `pocketcontext.json`.
 From the application directory:
 
 ```sh
-pocketcontext migrate up --dir ./pb_data
-pocketcontext serve --dir ./pb_data --http 127.0.0.1:8090
+./pocketcontext migrate up --dir ./pb_data
+./pocketcontext serve --dir ./pb_data --http 127.0.0.1:8090
 ```
 
 For a source build, use `../pocketcontext/bin/pocketcontext` instead. Always set
