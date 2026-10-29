@@ -25,7 +25,9 @@ class InstallerFixture:
     def __init__(self, os_name="Linux", machine="x86_64", checksum=None):
         self.checksum = checksum or ("sha256sum" if shutil.which("sha256sum") else "shasum")
         self.temporary = tempfile.TemporaryDirectory(prefix="pocketcontext-installer-test-")
-        self.root = Path(self.temporary.name)
+        # Resolve symlinked temporary roots such as macOS /var -> /private/var,
+        # matching the physical path the installer reports.
+        self.root = Path(self.temporary.name).resolve()
         self.home = self.root / "home"
         self.home.mkdir()
         self.project = self.root / "project with spaces $(false)"

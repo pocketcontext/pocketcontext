@@ -28,11 +28,11 @@ Every platform preserves `sqlite_math_functions,sqlite_percentile,sqlite_fts5`
 and CGO. Linux release inspection rejects dynamic ELF dependencies and an ELF
 interpreter. No additional SQLite or Go resolver build tags are enabled.
 
-The five public assets for `v0.9.3` are:
+The five public assets for `v0.9.4` are:
 
-- `pocketcontext_0.9.3_linux_amd64.tar.gz`
-- `pocketcontext_0.9.3_linux_arm64.tar.gz`
-- `pocketcontext_0.9.3_darwin_arm64.tar.gz`
+- `pocketcontext_0.9.4_linux_amd64.tar.gz`
+- `pocketcontext_0.9.4_linux_arm64.tar.gz`
+- `pocketcontext_0.9.4_darwin_arm64.tar.gz`
 - `checksums.txt`
 - `install.sh`
 
@@ -53,7 +53,7 @@ The `Release` workflow supports manual build validation from `main`. A manual
 run never creates a tag, draft or public release:
 
 ```sh
-gh workflow run release.yml --ref main -f version=0.9.3
+gh workflow run release.yml --ref main -f version=0.9.4
 gh run list --workflow release.yml --limit 5
 gh run watch RUN_ID --exit-status
 gh run view RUN_ID --json headSha,conclusion
@@ -78,7 +78,7 @@ outbound TLS. Ordinary server tests provide the broader behavioral coverage.
 The assembly job checks all three artifact manifests identify the same version
 and commit, verifies archive checksums and layouts, then renders `install.sh` and
 the final checksum manifest. A successful manual run retains its complete
-`release-0.9.3` workflow artifact for 14 days.
+`release-0.9.4` workflow artifact for 14 days.
 
 Offline tooling checks also run in the ordinary push/pull-request test workflow:
 
@@ -92,9 +92,9 @@ Linux additionally needs Docker; macOS needs the command line developer tools.
 The commit must be the full SHA of the checkout:
 
 ```sh
-python3 scripts/release.py build --version 0.9.3 --commit FULL_COMMIT_SHA --platform linux_amd64 --output dist
-python3 tests/release_smoke.py --binary dist/linux_amd64/pocketcontext --version 0.9.3 --commit FULL_COMMIT_SHA
-python3 tests/installer.py --binary dist/linux_amd64/pocketcontext --version 0.9.3
+python3 scripts/release.py build --version 0.9.4 --commit FULL_COMMIT_SHA --platform linux_amd64 --output dist
+python3 tests/release_smoke.py --binary dist/linux_amd64/pocketcontext --version 0.9.4 --commit FULL_COMMIT_SHA
+python3 tests/installer.py --binary dist/linux_amd64/pocketcontext --version 0.9.4
 ```
 
 Use `linux_arm64` or `darwin_arm64` on those native hosts. Cross-compilation is
@@ -123,15 +123,15 @@ publication if someone disabled immutability after the maintainer's preflight.
 Create the tag at the exact successfully tested commit and push only that tag:
 
 ```sh
-git tag -a v0.9.3 FULL_COMMIT_SHA -m 'PocketContext 0.9.3'
-git push origin v0.9.3
+git tag -a v0.9.4 FULL_COMMIT_SHA -m 'PocketContext 0.9.4'
+git push origin v0.9.4
 ```
 
 The workflow rejects malformed versions and commits outside `main` ancestry.
 It rebuilds and validates every platform before a serialized publishing job
 creates a draft, uploads all five assets, downloads them again and verifies their
 checksums. Only then does it publish the draft and check it is immutable. The
-release is regular, not a prerelease; `0.9.3` is valid as a regular release. A
+release is regular, not a prerelease; `0.9.4` is valid as a regular release. A
 release becomes latest only if its version is greater than the existing latest
 version. Parallel builds cannot move latest backward by finishing out of order.
 
