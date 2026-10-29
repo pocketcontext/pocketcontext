@@ -7,7 +7,7 @@ The server embeds PocketBase v0.40.4. By default, a separate read-only SQLite co
 ## Install
 
 ```sh
-curl -fsSL https://pocketcontext.com/pocketcontext/install.sh | sh
+curl -fsSL https://business.pocketcontext.com/pocketcontext/install.sh | sh
 ```
 
 The installer supports Linux amd64 and arm64, and macOS 15 or later on Apple

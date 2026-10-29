@@ -334,7 +334,7 @@ def publish(args):
     else:
         body = (f"PocketContext {release_version}\n\n"
                 "Linux amd64 and arm64: static musl binaries. macOS arm64: macOS 15 or later, ad hoc signed.\n\n"
-                "Install: `curl -fsSL https://pocketcontext.com/pocketcontext/install.sh | sh`\n\n"
+                "Install: `curl -fsSL https://business.pocketcontext.com/pocketcontext/install.sh | sh`\n\n"
                 "See [installation and release documentation](https://github.com/pocketcontext/pocketcontext/blob/"
                 f"{tag}/docs/releases.md).\n\n{marker}")
         release = api("releases", "POST", {"tag_name": tag, "target_commitish": revision,
