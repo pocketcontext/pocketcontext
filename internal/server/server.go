@@ -23,6 +23,7 @@ import (
 )
 
 type Config struct {
+	Identity       *IdentityConfig         `json:"identity,omitempty"`
 	Tracing        tracing.Config          `json:"tracing"`
 	AuthCollection string                  `json:"authCollection"`
 	Tables         map[string][]string     `json:"tables"`
@@ -127,6 +128,11 @@ func LoadConfig(path string) (Config, error) {
 	if err := c.Tracing.Validate(); err != nil {
 		return c, err
 	}
+	if c.Identity != nil {
+		if err := c.Identity.validate(c.AuthCollection); err != nil {
+			return c, err
+		}
+	}
 	return c, nil
 }
 
@@ -145,6 +151,11 @@ func Register(app core.App, configPath string) {
 		auth, err := app.FindCollectionByNameOrId(cfg.AuthCollection)
 		if err != nil || !auth.IsAuth() {
 			return fmt.Errorf("authCollection must be an existing auth collection")
+		}
+		if cfg.Identity != nil {
+			if err := registerIdentity(app, e, *cfg.Identity); err != nil {
+				return err
+			}
 		}
 		validatedTables := make(map[string][]string, len(cfg.Tables))
 		for name, columns := range cfg.Tables {

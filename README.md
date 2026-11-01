@@ -106,6 +106,10 @@ An empty column list exposes the collection's current nonhidden columns. The ser
 
 Create the application's auth collection in a migration. Provision accounts through an administrator, then authenticate through PocketBase's normal `auth-with-password` endpoint. SQL routes accept tokens only from the configured collection, including no special bypass for superuser tokens.
 
+## Optional hosted identity
+
+Applications using default `users` can opt into [hosted identity assertions](docs/identity.md). The configured issuer exchanges short-lived signed assertions for nonrefreshable application tokens, preserving application authorization hooks and direct OAuth fallback.
+
 ## Read with SQL
 
 ```sh
