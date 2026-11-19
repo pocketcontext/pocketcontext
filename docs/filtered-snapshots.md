@@ -96,6 +96,13 @@ users are evicted by `maxCachedUsers`, not automatically by disk pressure. A ful
 cache can therefore delay freshness until space is available or its budget is
 increased. Active readers retain their old files until they finish.
 
+`idleTimeoutMs` retires a requester's cached generation after a period without
+a SQL read, search or status request. It defaults to zero (disabled) and accepts
+60,000 through 86,400,000 milliseconds when enabled. A read already waiting for
+a build can finish. An in-progress build can also finish, and a retired file
+stays on disk until its last lease closes. The requester's next read after
+retirement starts a cold build.
+
 The budget accounts for private generation files. Source databases/WAL, SQLite
 temporary working files and unrelated host storage need separate capacity.
 The free-space reserve is checked before growth; it is not a filesystem quota.
@@ -250,8 +257,25 @@ Set `snapshot.trackChanges` to `true` to track changes to configured output and
 policy tables and the authentication collection. The default remains `false`,
 using global `data_version` invalidation without changing the source schema.
 
-The refresh and immediate-freshness details in this section describe synchronous
-mode. Background mode retains the eventual-consistency contract above.
+In background mode, the monitor advances the freshness barrier when a change
+affects an export, its filter dependencies or the authentication collection.
+Unrelated writes preserve the generation even for fresh reads. Replacements
+still export the full database and initialize private search. A tracked source
+must pass validation before granting a new SQL or search lease. Schema changes
+require a restart to validate the configuration. Time-dependent policies keep
+their periodic refresh and fresh-read behavior.
+
+Operators can read process-wide counters with superuser authentication at
+`GET /api/context/snapshot/metrics` in background mode. `observedChanges`
+counts successive distinct observations of the monitor's data version after
+the first sample. Several commits can fall between observations.
+`unrelatedChanges` counts those observations that tracking could skip.
+`completedBuilds`, `failedBuilds`, `coldBuilds` (completed with no prior copy)
+and `idleRetirements` are cumulative. `cachedUsers` is the current number of
+retained requester entries. `generationBytes` sums the logical size of
+successfully published generations, including their prebuilt search indexes.
+Use process I/O counters for physical-write comparisons. The remaining refresh
+and immediate-freshness details below describe synchronous mode.
 
 On first enabled startup, the ordinary application writer installs the internal
 `_context_snapshot_versions` table and three server-owned triggers per tracked

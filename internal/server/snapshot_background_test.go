@@ -132,6 +132,60 @@ func TestBackgroundSnapshotHTTPMetadataFreshnessAndIsolation(t *testing.T) {
 	}
 }
 
+func TestBackgroundMetricsRequireSuperuser(t *testing.T) {
+	app, cfg, tokens, _ := snapshotFixture(t)
+	cfg.Snapshot.TrackChanges = true
+	cfg.Snapshot.Background = &sqlread.BackgroundSnapshotConfig{}
+	admins, err := app.FindCollectionByNameOrId("_superusers")
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin := core.NewRecord(admins)
+	admin.SetEmail("snapshot-operator@example.com")
+	admin.SetPassword("test-password-12345")
+	if err := app.Save(admin); err != nil {
+		t.Fatal(err)
+	}
+	adminToken, err := admin.NewAuthToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := startConfiguredRouter(t, app, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const path = "/api/context/snapshot/metrics"
+	for _, token := range []string{"", tokens["alice"]} {
+		r := request(h, http.MethodGet, path, token, "")
+		if r.Code != http.StatusForbidden && r.Code != http.StatusUnauthorized {
+			t.Fatalf("aggregate metrics accessible: %d", r.Code)
+		}
+	}
+	read := func() {
+		t.Helper()
+		r := request(h, http.MethodPost, "/api/context/query", tokens["alice"], `{"sql":"SELECT name FROM compensation","consistency":"fresh"}`)
+		if r.Code != http.StatusOK {
+			t.Fatalf("query failed: %d", r.Code)
+		}
+	}
+	read()
+	if _, err := app.DB().NewQuery("INSERT INTO deals (title) VALUES ('unrelated')").Execute(); err != nil {
+		t.Fatal(err)
+	}
+	read()
+	r := request(h, http.MethodGet, path, adminToken, "")
+	var m sqlread.BackgroundSnapshotMetrics
+	if r.Code != http.StatusOK || r.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("operator metrics response: %d", r.Code)
+	}
+	if err := json.Unmarshal(r.Body.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m.CachedUsers != 1 || m.ColdBuilds != 1 || m.CompletedBuilds != 1 || m.FailedBuilds != 0 || m.GenerationBytes == 0 || m.ObservedChanges == 0 || m.UnrelatedChanges == 0 {
+		t.Fatalf("unexpected metrics: %+v", m)
+	}
+}
+
 func TestSnapshotHTTPOptionsKeepLegacyContract(t *testing.T) {
 	t.Run("shared", func(t *testing.T) {
 		app, token, _ := fixture(t)

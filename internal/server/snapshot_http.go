@@ -12,6 +12,10 @@ import (
 )
 
 func registerSnapshotStatus(e *core.ServeEvent, authCollection string, source *sqlread.SnapshotSource) {
+	e.Router.GET("/api/context/snapshot/metrics", func(re *core.RequestEvent) error {
+		re.Response.Header().Set("Cache-Control", "no-store")
+		return re.JSON(http.StatusOK, source.BackgroundMetrics())
+	}).Bind(apis.RequireSuperuserAuth())
 	e.Router.GET("/api/context/snapshot", func(re *core.RequestEvent) error {
 		re.Response.Header().Set("Cache-Control", "no-store")
 		status, err := source.SnapshotStatus(re.Request.Context(), re.Auth.Id)

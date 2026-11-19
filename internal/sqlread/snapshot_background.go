@@ -25,6 +25,7 @@ type BackgroundSnapshotConfig struct {
 	BuildTimeoutMS    int   `json:"buildTimeoutMs"`
 	MaxBuilders       int   `json:"maxBuilders"`
 	MaxCachedUsers    int   `json:"maxCachedUsers"`
+	IdleTimeoutMS     int   `json:"idleTimeoutMs,omitempty"`
 	RefreshIntervalMS int   `json:"refreshIntervalMs"`
 	RetryDelayMS      int   `json:"retryDelayMs"`
 	MaxValueBytes     int   `json:"maxValueBytes"`
@@ -39,6 +40,9 @@ func normalizeBackground(c *BackgroundSnapshotConfig) error {
 	}
 	if c.MaxDiskBytes < 65536 || c.MaxDiskBytes > 1<<40 || c.MinFreeBytes < 0 || c.MinFreeBytes > 1<<40 {
 		return errors.New("background snapshot disk budgets outside permitted range")
+	}
+	if c.IdleTimeoutMS != 0 && (c.IdleTimeoutMS < 60000 || c.IdleTimeoutMS > 86400000) {
+		return errors.New("background snapshot idleTimeoutMs must be zero or between 60000 and 86400000")
 	}
 	for _, v := range []struct {
 		p             *int
@@ -87,28 +91,53 @@ type backgroundUser struct {
 	retryAt                 time.Time
 	failures                int
 	used                    time.Time
+	waiters                 int
 	changed                 chan struct{}
 }
 
 type backgroundSnapshots struct {
-	source          *SnapshotSource
-	config          BackgroundSnapshotConfig
-	ctx             context.Context
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
-	stopOnce        sync.Once
-	mu              sync.Mutex
-	users           map[string]*backgroundUser
-	retired         map[*snapshotEntry]bool
-	jobs            chan string
-	observeMu       sync.Mutex
-	version         int64
-	observed        bool
-	epoch, sequence uint64
-	instance        string
-	storageMu       sync.Mutex
-	reservations    map[string]int64
-	storageChanged  chan struct{}
+	metrics           BackgroundSnapshotMetrics // protected by mu
+	source            *SnapshotSource
+	config            BackgroundSnapshotConfig
+	ctx               context.Context
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
+	stopOnce          sync.Once
+	mu                sync.Mutex
+	users             map[string]*backgroundUser
+	retired           map[*snapshotEntry]bool
+	jobs              chan string
+	observeMu         sync.Mutex
+	state             snapshotState
+	observed          bool
+	sourceCheckFailed bool
+	epoch, sequence   uint64
+	instance          string
+	storageMu         sync.Mutex
+	reservations      map[string]int64
+	storageChanged    chan struct{}
+}
+
+// BackgroundSnapshotMetrics summarizes this process's background work. GenerationBytes
+// counts completed SQL and warm index files at publication, in logical bytes.
+type BackgroundSnapshotMetrics struct {
+	ObservedChanges  uint64 `json:"observedChanges"`
+	UnrelatedChanges uint64 `json:"unrelatedChanges"`
+	CompletedBuilds  uint64 `json:"completedBuilds"`
+	FailedBuilds     uint64 `json:"failedBuilds"`
+	ColdBuilds       uint64 `json:"coldBuilds"`
+	IdleRetirements  uint64 `json:"idleRetirements"`
+	GenerationBytes  uint64 `json:"generationBytes"`
+	CachedUsers      int    `json:"cachedUsers"`
+}
+
+func (s *SnapshotSource) BackgroundMetrics() BackgroundSnapshotMetrics {
+	b := s.background
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	metrics := b.metrics
+	metrics.CachedUsers = len(b.users)
+	return metrics
 }
 
 type snapshotDiskBudgetKey struct{}
@@ -154,22 +183,39 @@ func (b *backgroundSnapshots) observe(ctx context.Context) (uint64, error) {
 	b.observeMu.Lock()
 	defer b.observeMu.Unlock()
 	b.source.cacheMu.Lock()
-	version, err := b.source.version(ctx)
+	state, err := b.source.state(ctx)
 	b.source.cacheMu.Unlock()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.source.snapshot.TrackChanges {
+		b.sourceCheckFailed = err != nil
+	}
 	if err != nil {
 		return 0, err
 	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if !b.observed || version != b.version {
-		b.observed, b.version = true, version
+	changed := !b.observed
+	if b.observed && state.version != b.state.version {
+		b.metrics.ObservedChanges++
+		changed = !b.source.snapshot.TrackChanges || len(b.source.changedExports(b.state, state)) > 0
+		if !changed {
+			b.metrics.UnrelatedChanges++
+		}
+	}
+	b.observed, b.state = true, state
+	if changed {
 		b.epoch++
 		for id, u := range b.users {
 			u.dirty = true
-			b.scheduleLocked(id, u)
+			b.refreshCachedUserLocked(id, u)
 		}
 	}
 	return b.epoch, nil
+}
+
+func (b *backgroundSnapshots) refreshCachedUserLocked(id string, u *backgroundUser) {
+	if !b.retireIdleLocked(id, u) {
+		b.scheduleLocked(id, u)
+	}
 }
 
 func (b *backgroundSnapshots) scheduleLocked(id string, u *backgroundUser) {
@@ -181,6 +227,24 @@ func (b *backgroundSnapshots) scheduleLocked(id string, u *backgroundUser) {
 		u.queued = true
 	default:
 	}
+}
+
+func (b *backgroundSnapshots) retireIdleLocked(id string, u *backgroundUser) bool {
+	if b.config.IdleTimeoutMS == 0 || u.building || u.queued || u.waiters > 0 ||
+		time.Since(u.used) < time.Duration(b.config.IdleTimeoutMS)*time.Millisecond {
+		return false
+	}
+	b.evictUserLocked(id, u)
+	b.metrics.IdleRetirements++
+	return true
+}
+
+func (b *backgroundSnapshots) evictUserLocked(id string, u *backgroundUser) {
+	delete(b.users, id)
+	if u.current != nil {
+		b.retireLocked(u.current)
+	}
+	close(u.changed)
 }
 
 func (b *backgroundSnapshots) watch() {
@@ -206,14 +270,14 @@ func (b *backgroundSnapshots) watch() {
 			if !b.source.cacheable {
 				u.dirty = true
 			}
-			b.scheduleLocked(id, u)
+			b.refreshCachedUserLocked(id, u)
 		}
 		b.mu.Unlock()
 	}
 }
 
 func (b *backgroundSnapshots) userLocked(id string) (*backgroundUser, error) {
-	if u := b.users[id]; u != nil {
+	if u := b.users[id]; u != nil && !b.retireIdleLocked(id, u) {
 		u.used = time.Now()
 		return u, nil
 	}
@@ -221,7 +285,7 @@ func (b *backgroundSnapshots) userLocked(id string) (*backgroundUser, error) {
 		var oldest string
 		var at time.Time
 		for key, u := range b.users {
-			if u.building || u.queued {
+			if u.building || u.queued || u.waiters > 0 {
 				continue
 			}
 			if at.IsZero() || u.used.Before(at) {
@@ -231,12 +295,7 @@ func (b *backgroundSnapshots) userLocked(id string) (*backgroundUser, error) {
 		if oldest == "" {
 			return nil, ErrSnapshotPending
 		}
-		u := b.users[oldest]
-		delete(b.users, oldest)
-		if u.current != nil {
-			b.retireLocked(u.current)
-		}
-		close(u.changed)
+		b.evictUserLocked(oldest, b.users[oldest])
 	}
 	u := &backgroundUser{dirty: true, used: time.Now(), changed: make(chan struct{})}
 	b.users[id] = u
@@ -268,6 +327,9 @@ func (b *backgroundSnapshots) tokenSequence(requester, token string) (uint64, er
 
 func (b *backgroundSnapshots) metadataLocked(u *backgroundUser) SnapshotMetadata {
 	m := SnapshotMetadata{Refreshing: u.building || u.queued, Stale: u.dirty, LastError: u.lastError}
+	if b.sourceCheckFailed {
+		m.Stale, m.LastError = true, "source_check_failed"
+	}
 	if e := u.current; e != nil {
 		m.Generation, m.CapturedAt, m.DiskBytes = e.generation, e.at, e.diskBytes
 		for _, size := range e.sizes {
@@ -388,18 +450,23 @@ func (s *SnapshotSource) AcquireSnapshot(ctx context.Context, requester string, 
 		}
 	}
 	var target uint64
-	if opts.Consistency == "fresh" {
-		target, err = b.observe(ctx)
+	if opts.Consistency == "fresh" || s.snapshot.TrackChanges {
+		// Every new tracked lease validates source health, even when the
+		// caller accepts a completed generation during an ordinary refresh.
+		epoch, err := b.observe(ctx)
 		if err != nil {
 			return nil, ErrSnapshotBuild
 		}
-		if !s.cacheable {
+		if opts.Consistency == "fresh" {
+			target = epoch
+		}
+		if opts.Consistency == "fresh" && !s.cacheable {
 			b.mu.Lock()
 			b.epoch++
 			target = b.epoch
 			for id, u := range b.users {
 				u.dirty = true
-				b.scheduleLocked(id, u)
+				b.refreshCachedUserLocked(id, u)
 			}
 			b.mu.Unlock()
 		}
@@ -412,6 +479,10 @@ func (s *SnapshotSource) AcquireSnapshot(ctx context.Context, requester string, 
 	defer cancel()
 	for {
 		b.mu.Lock()
+		if b.sourceCheckFailed {
+			b.mu.Unlock()
+			return nil, ErrSnapshotBuild
+		}
 		u, err := b.userLocked(requester)
 		if err != nil {
 			b.mu.Unlock()
@@ -437,18 +508,27 @@ func (s *SnapshotSource) AcquireSnapshot(ctx context.Context, requester string, 
 			return nil, ErrSnapshotResource
 		}
 		u.dirty = true
+		u.waiters++
 		b.scheduleLocked(requester, u)
 		changed := u.changed
 		b.mu.Unlock()
+		var waitErr error
 		select {
 		case <-changed:
 		case <-waitCtx.Done():
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
+			waitErr = ctx.Err()
+			if waitErr == nil {
+				waitErr = ErrSnapshotPending
 			}
-			return nil, ErrSnapshotPending
 		case <-b.ctx.Done():
-			return nil, ErrSnapshotBuild
+			waitErr = ErrSnapshotBuild
+		}
+		b.mu.Lock()
+		u.waiters--
+		u.used = time.Now()
+		b.mu.Unlock()
+		if waitErr != nil {
+			return nil, waitErr
 		}
 	}
 }
@@ -500,6 +580,7 @@ func (b *backgroundSnapshots) worker() {
 		}
 		ctx, cancel := context.WithTimeout(b.ctx, time.Duration(b.config.BuildTimeoutMS)*time.Millisecond)
 		epoch, err := b.observe(ctx)
+		initialCheckFailed := err != nil
 		b.mu.Lock()
 		u := b.users[id]
 		if u == nil {
@@ -508,7 +589,7 @@ func (b *backgroundSnapshots) worker() {
 			continue
 		}
 		u.queued = false
-		if u.building || !u.dirty {
+		if b.retireIdleLocked(id, u) || u.building || !u.dirty {
 			b.mu.Unlock()
 			cancel()
 			continue
@@ -536,13 +617,18 @@ func (b *backgroundSnapshots) worker() {
 			continue
 		}
 		u.building = false
-		if err != nil || b.ctx.Err() != nil {
+		failedCheck := b.source.snapshot.TrackChanges && (initialCheckFailed || checkErr != nil || b.sourceCheckFailed)
+		if err != nil || failedCheck || b.ctx.Err() != nil {
+			b.metrics.FailedBuilds++
 			if entry != nil {
 				b.removeLocked(entry)
 			}
 			u.dirty = true
 			u.failures++
 			u.lastError = backgroundError(err)
+			if failedCheck {
+				u.lastError = "source_check_failed"
+			}
 			delay := time.Duration(b.config.RetryDelayMS) * time.Millisecond
 			for n := 1; n < u.failures && n < 7; n++ {
 				delay *= 2
@@ -554,7 +640,11 @@ func (b *backgroundSnapshots) worker() {
 		} else {
 			if u.current != nil {
 				b.retireLocked(u.current)
+			} else {
+				b.metrics.ColdBuilds++
 			}
+			b.metrics.CompletedBuilds++
+			b.metrics.GenerationBytes += uint64(entry.diskBytes)
 			entry.retained = true
 			u.current = entry
 			u.dirty = checkErr != nil || epoch < b.epoch
@@ -567,7 +657,7 @@ func (b *backgroundSnapshots) worker() {
 		}
 		close(u.changed)
 		u.changed = make(chan struct{})
-		b.scheduleLocked(id, u)
+		b.refreshCachedUserLocked(id, u)
 		b.mu.Unlock()
 	}
 }
